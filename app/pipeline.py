@@ -47,9 +47,12 @@ def _to_entries(hits: list[dict], order: list[int], scores: dict[int, float]) ->
             for i in order for h in [hits[i]]]
 
 
-def retrieve(question: str, top_k: int = TOP_K, rid: str | None = None):
-    """混合检索：两路召回 + RRF 融合 Top-20 → rerank 精排 Top-3。
-    rerank 失败降级回融合顺序（精度损失可控、可用性优先）。返回 (entries, reranked)。
+def retrieve(question: str, top_k: int = TOP_K, rid: str | None = None,
+             use_rerank: bool = False):
+    """混合检索：两路召回 + RRF 融合 Top-20 → 直接取 Top-K。
+    rerank 层默认关闭——10-29 评测实证：智谱 rerank 分数压缩在 0.99999X 饱和
+    （接口/参数无误，微差排序对噪声敏感），开着检索 -11.8pp、延迟 +0.5s；
+    use_rerank=True 留作换 rerank 供应商后再 A/B。返回 (entries, reranked)。
     rid 不传则自动生成——每次检索都有 span 可查。"""
     rid = rid or trace.new_request_id()
     t_all = time.perf_counter()
@@ -61,6 +64,11 @@ def retrieve(question: str, top_k: int = TOP_K, rid: str | None = None):
     t = time.perf_counter()
     hits = store.hybrid_search(question, query_vec, top_k=RECALL_K)
     trace.record(rid, "search", (time.perf_counter() - t) * 1000)
+
+    if not use_rerank:
+        entries = _to_entries(hits, list(range(top_k)), {})
+        trace.record(rid, "retrieve", (time.perf_counter() - t_all) * 1000)
+        return entries, False
 
     docs = [h["entity"]["text"] for h in hits]
     t = time.perf_counter()

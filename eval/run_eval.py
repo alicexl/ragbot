@@ -95,6 +95,8 @@ def main():
                     help="每条 case 的生成次数（pass@N / pass^N 的 N，默认 3）")
     ap.add_argument("--top-k", type=int, default=TOP_K,
                     help="检索进生成 context 的条数（默认=生产常量 TOP_K；仅评测实验，不改生产）")
+    ap.add_argument("--rerank", action="store_true",
+                    help="打开 rerank 层（默认关闭——10-29 评测实证净负，留作换供应商后 A/B）")
     args = ap.parse_args()
 
     pipeline.init(db_path=EVAL_DB)
@@ -126,7 +128,8 @@ def main():
         k_passed = 0
         for _ in range(args.runs):
             t0 = time.perf_counter()
-            retrieved, reranked = pipeline.retrieve(case["question"], top_k=args.top_k)
+            retrieved, reranked = pipeline.retrieve(case["question"], top_k=args.top_k,
+                                                    use_rerank=args.rerank)
             ret_ms.append((time.perf_counter() - t0) * 1000)
             degraded += (not reranked)
 
@@ -184,7 +187,8 @@ def main():
     print(f"  pass@{args.runs}  {pass_at}/{n_gen_cases} · "
           f"pass^{args.runs}  {pass_all}/{n_gen_cases}")
     print("过程与成本")
-    print(f"  rerank 降级 {degraded}/{len(ret_ms)} · "
+    rerank_note = f"rerank 降级 {degraded}/{len(ret_ms)}" if args.rerank else "rerank 关闭（融合序）"
+    print(f"  {rerank_note} · "
           f"检索 中位 {_percentile(ret_ms, 50):.0f}ms / P95 {_percentile(ret_ms, 95):.0f}ms · "
           f"生成 中位 {_percentile(gen_s, 50):.1f}s / P95 {_percentile(gen_s, 95):.1f}s")
     print(f"  token 合计 {tok:,} · 均 {tok // len(gen_s):,}/次 · {len(gen_s)} 次生成")
