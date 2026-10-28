@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mini-RAG · 问答助手</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: system-ui, "Microsoft YaHei", sans-serif;
+    background: #f5f6f8; color: #24292f;
+  }
+  header { padding: 18px 24px 6px; }
+  header h1 { margin: 0; font-size: 22px; }
+  header p { margin: 4px 0 0; color: #6a737d; font-size: 13px; }
+  main { display: flex; gap: 16px; padding: 12px 24px 24px; align-items: stretch; }
+
+  .card {
+    background: #fff; border: 1px solid #e1e4e8; border-radius: 8px; padding: 12px;
+    font-size: 13px; line-height: 1.6;
+  }
+
+  /* 左栏：文档管理 */
+  #side { width: 280px; flex-shrink: 0; display: flex; flex-direction: column; gap: 10px; }
+  #side .card { white-space: pre-wrap; }
+  #upload-note { font-size: 12px; color: #6a737d; white-space: pre-wrap; min-height: 18px; }
+  .hint { font-size: 12px; color: #8b949e; margin: 0; }
+
+  .btn {
+    display: inline-block; padding: 7px 14px; border-radius: 6px; border: 1px solid #d0d7de;
+    background: #f6f8fa; color: #24292f; font-size: 14px; text-align: center; cursor: pointer;
+    user-select: none;
+  }
+  .btn.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+  .btn.danger { background: #fff; border-color: #cf222e; color: #cf222e; }
+  .btn:active { transform: translateY(1px); }
+
+  /* 右栏：来源 + 聊天 + 输入 */
+  #chat-area { flex: 1; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+  #sources { color: #57606a; max-height: 220px; overflow-y: auto; white-space: pre-wrap; }
+  #chat {
+    flex: 1; min-height: 380px; max-height: 55vh; overflow-y: auto; padding: 12px;
+    background: #fff; border: 1px solid #e1e4e8; border-radius: 8px;
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  .bubble {
+    max-width: 78%; padding: 8px 12px; border-radius: 10px; font-size: 14px;
+    line-height: 1.65; white-space: pre-wrap; word-break: break-word;
+  }
+  .bubble.user { align-self: flex-end; background: #ddf4ff; }
+  .bubble.assistant { align-self: flex-start; background: #f0f1f3; }
+
+  #ask { display: flex; gap: 8px; }
+  #msg {
+    flex: 1; padding: 9px 12px; font-size: 14px; border: 1px solid #d0d7de;
+    border-radius: 6px; outline: none;
+  }
+  #msg:focus { border-color: #1f6feb; box-shadow: 0 0 0 3px rgba(31,111,235,.15); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Mini-RAG · 问答助手</h1>
+  <p>把 Step 1-4 的 RAG 做成一个能用的聊天产品。</p>
+</header>
+<main>
+  <!-- 左栏：文档管理 -->
+  <aside id="side">
+    <div id="status" class="card">加载中…</div>
+    <!-- 浏览器原生文件框：hidden 掉 input 本体，label 当按钮用；multiple 支持一次多选 -->
+    <input type="file" id="file" multiple accept=".md,.txt,.pdf" hidden>
+    <label for="file" class="btn primary">导入</label>
+    <button id="clear" class="btn danger">清空</button>
+    <div id="upload-note"></div>
+    <p class="hint">示例语料在 step4_app/sample_reports/（年报精选页 PDF 含表格图片，md 节选为纯文本）</p>
+  </aside>
+
+  <!-- 右栏：来源 + 聊天 + 输入 -->
+  <section id="chat-area">
+    <div id="sources" class="card">提问后，这里显示本次检索的来源 [1][2][3] 及出处文件</div>
+    <div id="chat"></div>
+    <form id="ask">
+      <input id="msg" placeholder="问点关于已导入文档的…（Enter 发送）" autocomplete="off">
+      <button class="btn primary" type="submit">发送</button>
+    </form>
+  </section>
+</main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+
+// 多轮对话历史 [{role, content}...]：由前端持有、随每次 /api/chat 请求带上——
+// 服务端不存任何会话状态（无状态服务），这正是聊天框架的 Chatbot 组件替你藏掉的那部分
+const history = [];
+// 一条回答没流完不接受下一条：教学 demo 单进程单向量库，并发流会互相打架
+let busy = false;
+
+/* ---------- 左栏：状态 / 导入 / 清空 ---------- */
+
+async function loadStatus() {
+  const r = await fetch("/api/status");
+  const s = await r.json();
+  const lines = [`向量库：${s.chunks} 个 chunk`, "", "已导入文档："];
+  lines.push(...(s.documents.length ? s.documents.map((d) => `- ${d}`) : ["-（空，请点「导入」选择文档）"]));
+  $("status").textContent = lines.join("\n");
+}
+
+function note(text) {
+  $("upload-note").textContent = text || "";
+}
+
+$("file").addEventListener("change", async () => {
+  const files = [...$("file").files];
+  $("file").value = "";                     // 复位，允许下次重选同一批文件（幂等由服务端兜底）
+  if (!files.length) return;
+  note("导入中…（切块 + 向量化）");
+  const fd = new FormData();
+  files.forEach((f) => fd.append("files", f));
+  const r = await fetch("/api/upload", { method: "POST", body: fd });
+  const s = await r.json();
+  note(s.notes ? s.notes.join("\n") : s.error || "导入失败");
+  loadStatus();
+});
+
+$("clear").addEventListener("click", async () => {
+  await fetch("/api/clear", { method: "POST" });
+  note("已清空向量库");
+  loadStatus();
+});
+
+/* ---------- 右栏：聊天（SSE 流式） ---------- */
+
+function addBubble(role, text) {
+  const div = document.createElement("div");
+  div.className = `bubble ${role}`;
+  div.textContent = text;                   // 只用 textContent：chunk 原文按纯文本显示，顺带免 XSS
+  $("chat").appendChild(div);
+  $("chat").scrollTop = $("chat").scrollHeight;
+  return div;
+}
+
+const TYPE_TAG = { text: "正文", table: "表格", image: "图片" };
+
+function renderSources(sources, reranked) {
+  const box = $("sources");
+  box.textContent = `本次检索来源（Milvus 两路召回：稠密向量 + BM25 → RRF 融合 → rerank 精排 → Top-3${reranked ? "" : "，rerank 失败已降级用融合顺序"}）：\n`;
+  const images = [];
+  for (const s of sources) {
+    const score = (s.score === null || s.score === undefined) ? "-" : s.score;
+    const page = s.page ? ` p${s.page}` : "";
+    box.textContent += `\n[${s.i}]（${TYPE_TAG[s.type] || "正文"}）rrf=${s.rrf} score=${score} · ${s.source}${page}\n    ${s.preview}…`;
+    if (s.image) images.push(s.image);   // 图片 chunk：下面回显原图
+  }
+  // 命中图片时展示原件：src 是服务端受控文件名（非用户文本），img 元素直接建、不走 innerHTML
+  for (const f of images) {
+    const img = document.createElement("img");
+    img.src = "/api/media/" + encodeURIComponent(f);
+    img.alt = f;
+    img.style.cssText = "max-width:200px;display:block;margin:8px 0 0;border:1px solid #e1e4e8;border-radius:6px";
+    box.appendChild(img);
+  }
+}
+
+$("ask").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const text = $("msg").value.trim();
+  if (!text || busy) return;
+  busy = true;
+  $("msg").value = "";
+  addBubble("user", text);
+  const bubble = addBubble("assistant", "…");
+
+  try {
+    const resp = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: text, history }),
+    });
+    if (!resp.ok) {                          // 请求级错误（空库/空消息）：400 + JSON
+      const err = await resp.json().catch(() => ({}));
+      bubble.textContent = "⚠️ " + (err.error || `请求失败（HTTP ${resp.status}）`);
+      return;
+    }
+
+    // SSE 解析：resp.body 是字节流，边读边按「空行」切帧，帧内取 event:/data: 两行。
+    // 用 fetch 而不是 EventSource：EventSource 只支持 GET，这里要 POST 请求体
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "", answer = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let cut;
+      while ((cut = buf.indexOf("\n\n")) >= 0) {
+        const frame = buf.slice(0, cut);
+        buf = buf.slice(cut + 2);
+        let event = "message", data = "";
+        for (const line of frame.split("\n")) {
+          if (line.startsWith("event: ")) event = line.slice(7);
+          if (line.startsWith("data: ")) data += line.slice(6);
+        }
+        const payload = data ? JSON.parse(data) : {};
+        if (event === "sources") renderSources(payload.sources, payload.reranked);
+        else if (event === "delta") { answer += payload.text; bubble.textContent = answer; }
+        else if (event === "error") { bubble.textContent = "⚠️ " + payload.message; }
+        else if (event === "done") {
+          // 完整落库进 history 才算一轮——中途出错的半截回答不入史
+          history.push({ role: "user", content: text },
+                       { role: "assistant", content: answer });
+        }
+      }
+    }
+  } catch (err) {
+    bubble.textContent = "⚠️ 网络错误：" + err;
+  } finally {
+    busy = false;
+  }
+});
+
+loadStatus();   // 每次进页面/刷新都拉一次真实状态（服务端无状态，不靠它记住页面）
+</script>
+</body>
+</html>

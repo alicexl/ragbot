@@ -1,0 +1,11 @@
+flask
+requests
+anthropic
+# milvus-lite 须单列一行：pymilvus 的 [milvus-lite] extra 带 sys_platform != 'win32' 标记，Windows 上装不上
+pymilvus
+milvus-lite
+# PDF 多模态解析：PDF 抽元素 + 表格转 HTML
+pymupdf
+pandas
+# 钉钉机器人（Stream 模式，出站连接免公网）
+dingtalk-stream

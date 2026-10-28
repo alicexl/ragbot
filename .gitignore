@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 环境 / 凭证
+.env
+.venv/
+venv/
+
+# 运行时数据：向量库 / 图片原件 / 会话与追踪 sqlite
+data/
+
+# 日志
+*.log
+
+# IDE
+.vscode/
+.idea/
