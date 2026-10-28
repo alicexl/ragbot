@@ -80,9 +80,11 @@ def retrieve(question: str, top_k: int = TOP_K, rid: str | None = None):
 
 
 def build_context(retrieved: list[dict]) -> str:
-    """把精排后的 Top-K 拼成带编号 + 类型标注的 context（回填 content 原文：表格=HTML、图片=描述）。"""
-    parts = [f"[{i}][{llm._TYPE_LABEL.get(e['type'], '正文')}] {e['content'] or e['text']}"
-             for i, e in enumerate(retrieved, 1)]
+    """把精排后的 Top-K 拼成带编号 + 类型 + 来源标注的 context（回填 content 原文：
+    表格=HTML、图片=描述）。来源标注让模型在多文档下按公司/年份正确归因——
+    10-29 实测：无来源标注时模型把盐湖的数字安到云天化头上（M01/M03 探针）。"""
+    parts = [f"[{i}][{llm._TYPE_LABEL.get(e['type'], '正文')}｜来源：{e['source']}] "
+             f"{e['content'] or e['text']}" for i, e in enumerate(retrieved, 1)]
     return "\n\n".join(parts)
 
 

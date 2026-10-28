@@ -37,16 +37,23 @@ def _percentile(xs: list[float], p: int) -> float:
 
 
 def _match(entry: dict, cand: dict) -> bool:
-    """检索层命中判定：只认评测主语料（EVAL_SOURCE）的块——多文档库中表格/图片
-    按 类型+页码、正文按 类型+关键词锚定，但都必须出自同一来源，否则 2023/2025/
-    云天化的同页码表格会假命中。"""
-    if entry["source"] != EVAL_SOURCE:
+    """检索层命中判定：默认只认评测主语料（EVAL_SOURCE）的块——多文档库中表格/
+    图片按 类型+页码、正文按 类型+关键词锚定，但都必须出自同一来源，否则
+    2023/2025/云天化的同页码表格会假命中。候选带 source 时以其为准（锚定新语料）。"""
+    if entry["source"] != cand.get("source", EVAL_SOURCE):
         return False
     if entry["type"] != cand["type"]:
         return False
     if "kw" in cand:
         return cand["kw"] in entry["text"]
     return entry["page"] == cand["page"]
+
+
+def _expect_groups(case: dict) -> list[list[dict]]:
+    """expect 归一化为组列表：候选列表（旧，单组 OR）或 组列表（新，组间 AND
+    组内 OR——B 类综合题要求多个出处都进 context）。"""
+    return case["expect"] if case["expect"] and isinstance(case["expect"][0], list) \
+        else [case["expect"]]
 
 
 def _score_answer(answer: str, case: dict) -> bool:
@@ -126,9 +133,10 @@ def main():
             if case["expect"] is not None:
                 ret_runs += 1
                 ret_by_layer.setdefault(case["layer"], [0, 0])[1] += 1
-                hit = any(_match(e, c) for e in retrieved[:3] for c in case["expect"])   # 历史口径 @3
-                hit_n = any(_match(e, c) for e in retrieved for c in case["expect"])     # 上下文口径 @N
-                top1 = any(_match(retrieved[0], c) for c in case["expect"])
+                groups = _expect_groups(case)
+                hit = all(any(_match(e, c) for e in retrieved[:3] for c in g) for g in groups)   # 历史口径 @3
+                hit_n = all(any(_match(e, c) for e in retrieved for c in g) for g in groups)     # 上下文口径 @N
+                top1 = any(_match(retrieved[0], c) for g in groups for c in g)
                 ret_hits += hit
                 ret_hits_n += hit_n
                 ret_top1 += top1
