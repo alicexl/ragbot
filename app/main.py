@@ -110,7 +110,8 @@ def chat():
     def stream():
         yield _sse("sources", {"sources": sources_payload, "reranked": reranked, "rid": rid})
         try:
-            sa = StreamedAnswer(llm.SYSTEM_PROMPT, llm_messages, rid=rid)
+            sa = StreamedAnswer(llm.SYSTEM_PROMPT, llm_messages, rid=rid,
+                                thinking_off=True)   # 关思考：与钉钉一致——首字快 + 省 token（评测同口径）
             for delta in sa:
                 yield _sse("delta", {"text": delta})
             limits.count_tokens(sa.usage)

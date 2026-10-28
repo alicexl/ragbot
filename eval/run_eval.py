@@ -3,23 +3,31 @@
 一次评测 = 给系统一个输入，用一段判分逻辑检查输出，看成没成：
 - 多次试验：每条 case 独立跑 --runs 次（默认 3），每次走完整链路
 - 判分器全用代码：检索层判「标准出处进没进 Top-3」，生成层判关键词组 / 拒答
+  （异常题 = 拒答词命中 且 没有带出 refute 编造关键词——「未提及，但 KCl」照样判错）
 - 指标按环节拆开：检索（命中@3、Top-1）与生成（答对率、拒绝率、pass@N / pass^N）
   分开报——成功率上不去时，才分得清是检索没捞到还是生成没答好
 
-启动（前提：智谱 Key 已设、库里已导入语料 PDF；先停掉服务——Milvus 单进程锁）:
+语料：评测用独立库 data/eval.db，自动导入 sample_reports/ 下全部 PDF + 干扰文档
+（eval/distractor.txt，虚构公司年报——考检索/归因不被无关文档带偏）。独立库不碰
+生产库 mini_rag.db，锁按文件隔离，线上服务不用停；eval.db 可整库删除重建。
+
+启动（前提：智谱 Key 已设）:
     python -X utf8 -m eval.run_eval             # 每条生成 3 次
     python -X utf8 -m eval.run_eval --runs 5
 """
 
 import argparse
-import statistics
+import os
 import time
+from pathlib import Path
 
-from anthropic import Anthropic
-
-from app import llm, pipeline
-from app.store import TOP_K
+from app import llm, pipeline, trace
+from app.store import DATA_DIR, TOP_K
 from eval.evalset import CASES, REFUSE_PATTERNS
+
+EVAL_DB = str(DATA_DIR / "eval.db")                           # 评测独立库，与生产隔离
+SAMPLE_DIR = Path(__file__).parent.parent / "sample_reports"  # 样本 PDF（多放即多干扰文档）
+DISTRACTOR = Path(__file__).parent / "distractor.txt"         # 虚构公司年报干扰语料
 
 
 def _percentile(xs: list[float], p: int) -> float:
@@ -38,20 +46,36 @@ def _match(entry: dict, cand: dict) -> bool:
 
 
 def _score_answer(answer: str, case: dict) -> bool:
-    """生成层判分：普通题 = 每组关键词任一命中、全部组通过；异常题 = 判拒答"""
+    """生成层判分：普通题 = 每组关键词任一命中、全部组通过；
+    异常题 = 拒答词命中 且 没有带出 refute 编造关键词（拒答后接着编造照样判错）"""
     if case["assert_groups"] is None:
-        return any(p in answer for p in REFUSE_PATTERNS)
+        refuse = any(p in answer for p in REFUSE_PATTERNS)
+        leak = any(r.lower() in answer.lower() for r in case.get("refute", []))
+        return refuse and not leak
     return all(any(k in answer for k in group) for group in case["assert_groups"])
 
 
-def generate(client: Anthropic, question: str, history: list[dict], retrieved: list[dict]):
-    """非流式生成探针：拼装口径与线上 chat / bot 完全同构，messages.create 一把拿
-    全文 + token 用量。glm-5.3 会带 ThinkingBlock，只取文本块。"""
-    resp = client.messages.create(model=llm._CHAT_MODEL, max_tokens=2048,
-                                  system=llm.SYSTEM_PROMPT,
-                                  messages=pipeline.build_user_msg(question, retrieved, history))
-    answer = "".join(b.text for b in resp.content if b.type == "text")
-    return answer, resp.usage.input_tokens + resp.usage.output_tokens
+def generate(question: str, history: list[dict], retrieved: list[dict]) -> tuple[str, int]:
+    """流式生成探针：与线上 web / bot 同一段代码（llm.StreamedAnswer——首字超时重试 +
+    总时长兜底、关思考），拼装口径同 pipeline.build_user_msg。评测测的就是线上这条链。"""
+    sa = llm.StreamedAnswer(llm.SYSTEM_PROMPT,
+                            pipeline.build_user_msg(question, retrieved, history),
+                            rid=trace.new_request_id(), thinking_off=True)
+    answer = "".join(sa)
+    return answer, sa.usage
+
+
+def _ensure_fixtures() -> str:
+    """评测库语料：sample_reports/ 下全部 PDF + distractor.txt（幂等，已入库自动跳过）。
+    首次导入 PDF 会跑 VLM 描述图片，慢属正常；想加真干扰文档就往 sample_reports 丢 PDF。"""
+    notes = []
+    for name in sorted(os.listdir(SAMPLE_DIR)):          # 中文/特殊字符文件名，不用 glob
+        if name.lower().endswith(".pdf"):
+            notes.append(pipeline.ingest_pdf((SAMPLE_DIR / name).read_bytes(),
+                                             Path(name).stem)[2])
+    notes.append(pipeline.ingest_text(DISTRACTOR.read_text(encoding="utf-8"),
+                                      DISTRACTOR.stem)[2])
+    return " · ".join(notes)
 
 
 def main():
@@ -60,16 +84,16 @@ def main():
                     help="每条 case 的生成次数（pass@N / pass^N 的 N，默认 3）")
     args = ap.parse_args()
 
-    pipeline.init()
+    pipeline.init(db_path=EVAL_DB)
+    print("[fixtures]", _ensure_fixtures())
     if not pipeline.store.chunk_count():
-        raise SystemExit("向量库为空：先导入 sample_reports/盐湖股份2024年报（精选页）.pdf 再跑评测")
-    client = Anthropic(base_url=llm._CHAT_BASE_URL, api_key=llm._CHAT_API_KEY)
+        raise SystemExit("评测库为空：检查 sample_reports/ 与 eval/distractor.txt")
 
     n_do = sum(1 for c in CASES if c["expect"] is not None)        # 该做的题（检索层也判）
     n_refuse = len(CASES) - n_do
     print("=" * 68)
-    print(f"ragbot 评测 · 库内 {pipeline.store.chunk_count()} 块 · 评测集 {len(CASES)} 条"
-          f"（该做 {n_do} / 不该做 {n_refuse}）· 每条生成 {args.runs} 次")
+    print(f"ragbot 评测 · 独立库 {pipeline.store.chunk_count()} 块（含干扰文档）"
+          f" · 评测集 {len(CASES)} 条（该做 {n_do} / 不该做 {n_refuse}）· 每条生成 {args.runs} 次")
     print("=" * 68)
 
     rows = []
@@ -77,10 +101,11 @@ def main():
     ret_by_layer: dict[str, list[int]] = {}
     gen_pass = gen_runs = 0
     refuse_pass = refuse_runs = 0
+    refuse_leak = 0
     degraded = 0
     ret_ms: list[float] = []
     gen_s: list[float] = []
-    in_tok = out_tok = 0
+    tok = 0
 
     for case in CASES:
         hit_any = top1_any = False
@@ -104,14 +129,16 @@ def main():
                 top1_any = top1_any or top1
 
             t0 = time.perf_counter()
-            answer, tokens = generate(client, case["question"], [], retrieved)
+            answer, tokens = generate(case["question"], [], retrieved)
             gen_s.append(time.perf_counter() - t0)
-            in_tok += tokens
+            tok += tokens
             ok = _score_answer(answer, case)
             k_passed += ok
             if case["assert_groups"] is None:
                 refuse_runs += 1
                 refuse_pass += ok
+                if not ok and any(p in answer for p in REFUSE_PATTERNS):
+                    refuse_leak += 1      # 拒答词命中却判错 = 拒答后还带出编造内容（refute 命中）
             else:
                 gen_runs += 1
                 gen_pass += ok
@@ -134,14 +161,15 @@ def main():
         f"{k} {v[0]}/{v[1]}" for k, v in ret_by_layer.items()))
     print("生成层（代码断言）")
     print(f"  该做的题   答对 {gen_pass}/{gen_runs}（{gen_pass / gen_runs:.1%}）")
-    print(f"  不该做的题 拒绝 {refuse_pass}/{refuse_runs}（{refuse_pass / refuse_runs:.1%}）")
+    print(f"  不该做的题 拒绝 {refuse_pass}/{refuse_runs}（{refuse_pass / refuse_runs:.1%}）"
+          f" · 拒答却带出编造内容 {refuse_leak} 次")
     print(f"  pass@{args.runs}  {pass_at}/{n_gen_cases} · "
           f"pass^{args.runs}  {pass_all}/{n_gen_cases}")
     print("过程与成本")
     print(f"  rerank 降级 {degraded}/{len(ret_ms)} · "
           f"检索 中位 {_percentile(ret_ms, 50):.0f}ms / P95 {_percentile(ret_ms, 95):.0f}ms · "
           f"生成 中位 {_percentile(gen_s, 50):.1f}s / P95 {_percentile(gen_s, 95):.1f}s")
-    print(f"  token（合计 {in_tok}）· {len(gen_s)} 次生成")
+    print(f"  token 合计 {tok:,} · 均 {tok // len(gen_s):,}/次 · {len(gen_s)} 次生成")
 
 
 if __name__ == "__main__":

@@ -22,8 +22,9 @@ reranker = None
 generator = None
 
 
-def init():
-    """入口调用：配置检查 → 初始化全部单例。返回 None（失败直接抛 SystemExit）。"""
+def init(db_path: str | None = None):
+    """入口调用：配置检查 → 初始化全部单例。返回 None（失败直接抛 SystemExit）。
+    db_path 不传 = 生产库 data/mini_rag.db；评测传 eval.db，与生产数据隔离。"""
     global embedder, splitter, store, reranker, generator
     if not llm._ZHIPU_API_KEY:
         raise SystemExit("未配置智谱 API Key（ANTHROPIC_API_KEY）——embedding/rerank/VLM 都依赖它")
@@ -35,7 +36,7 @@ def init():
     reranker = llm.Reranker(llm._ZHIPU_API_KEY)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     MEDIA_DIR.mkdir(parents=True, exist_ok=True)
-    store = MilvusStore(str(DATA_DIR / "mini_rag.db"))
+    store = MilvusStore(db_path or str(DATA_DIR / "mini_rag.db"))
 
 
 def _to_entries(hits: list[dict], order: list[int], scores: dict[int, float]) -> list[dict]:
