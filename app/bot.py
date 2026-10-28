@@ -26,9 +26,8 @@ import time
 
 import dingtalk_stream
 from dingtalk_stream import AckMessage
-from anthropic import Anthropic
 
-from . import llm, pipeline
+from . import limits, llm, pipeline, trace
 from .store import DATA_DIR, TOP_K
 
 log = logging.getLogger("ragbot.bot")
@@ -92,43 +91,39 @@ def build_reply(answer: str, retrieved: list[dict]) -> str:
     return "".join(parts)
 
 
-def generate_stream(client: Anthropic, question: str, history: list[dict],
-                    retrieved: list[dict], card) -> tuple[str, int]:
-    """流式生成 + AI 卡片打字机（拼装口径走 pipeline，与 Web/评测同构）。
-    - thinking 关闭：数值问答不需要长思考，快 ~30% 且省全部思考 tokens
-    - 卡片推送 ~1s 节流；usage 从 get_final_message() 拿（with 块内，流式也能记账）"""
+def generate_stream(question: str, history: list[dict], retrieved: list[dict],
+                    card, rid: str) -> tuple[str, int]:
+    """流式生成 + AI 卡片打字机。生成走 llm.StreamedAnswer（首字超时重试/总时长兜底
+    都在里面，与 Web 端同一条生成路径）；thinking 关闭：数值问答不需要长思考。
+    卡片推送 ~1s 节流；usage 事后从 sa.usage 取。"""
     buf, last_push, n_push = "", 0.0, 0
-    with client.messages.stream(
-            model=llm._CHAT_MODEL, max_tokens=2048,
-            system=llm.SYSTEM_PROMPT,
-            messages=pipeline.build_user_msg(question, retrieved, history),
-            thinking={"type": "disabled"}) as s:
-        for delta in s.text_stream:
-            buf += delta
-            now = time.time()
-            if card and now - last_push >= 1.0:
-                # 打字机三要素：首帧经 ai_streaming 置 INPUTING 态，后续帧底层直发全量，
-                # 终帧 isFinalize 由调用方补——SDK 的 ai_streaming 永远不置 finished，
-                # 缺终帧时卡片会挂在流式会话里、只渲染第一帧
-                if n_push == 0:
-                    card.ai_streaming(buf)
-                else:
-                    card.streaming(card.card_instance_id, "msgContent", buf,
-                                   append=False, finished=False, failed=False)
-                n_push += 1
-                last_push = now
-        usage = s.get_final_message().usage
+    sa = llm.StreamedAnswer(llm.SYSTEM_PROMPT,
+                            pipeline.build_user_msg(question, retrieved, history),
+                            rid=rid, thinking_off=True)
+    for delta in sa:
+        buf += delta
+        now = time.time()
+        if card and now - last_push >= 1.0:
+            # 打字机三要素：首帧经 ai_streaming 置 INPUTING 态，后续帧底层直发全量，
+            # 终帧 isFinalize 由调用方补——SDK 的 ai_streaming 永远不置 finished，
+            # 缺终帧时卡片会挂在流式会话里、只渲染第一帧
+            if n_push == 0:
+                card.ai_streaming(buf)
+            else:
+                card.streaming(card.card_instance_id, "msgContent", buf,
+                               append=False, finished=False, failed=False)
+            n_push += 1
+            last_push = now
     log.info("流式 %d 帧 / 共 %d 字", n_push, len(buf))
-    return buf, usage.input_tokens + usage.output_tokens
+    return buf, sa.usage
 
 
 class RAGBotHandler(dingtalk_stream.ChatbotHandler):
     """钉钉消息 → RAG 链路 → 卡片流式回复。ACK 与回答分离：process 立刻返回，
     生成丢线程池异步做——同步等完长尾生成会触发钉钉超时重推。"""
 
-    def __init__(self, client: Anthropic):
+    def __init__(self):
         super().__init__()
-        self.client = client
         self._seen: dict[str, float] = {}     # message_id -> ts，挡重推造成的重复回答
         self._lock = threading.Lock()
 
@@ -166,6 +161,7 @@ class RAGBotHandler(dingtalk_stream.ChatbotHandler):
         question = (msg.text.content if msg.text else "").strip()
         question = re.sub(r"^@\S+\s*", "", question)     # 群聊 @机器人 前缀剥掉
         nick = msg.sender_nick or msg.sender_staff_id or "?"
+        user = f"dingtalk:{msg.sender_staff_id or nick}"
         conv = msg.conversation_id or "default"
         if not question:
             self.reply_text("暂时只支持文字提问。", msg)
@@ -173,10 +169,16 @@ class RAGBotHandler(dingtalk_stream.ChatbotHandler):
         if not pipeline.store.chunk_count():
             self.reply_text("向量库是空的：先在 Web 界面导入文档，再回来提问。", msg)
             return
+        ok, why = limits.allow(user)
+        if not ok:
+            self.reply_text(why, msg)
+            return
+        limits.count_question(user)
 
-        history = load_history(conv)
+        rid = trace.new_request_id()
         t0 = time.perf_counter()
-        retrieved, reranked = pipeline.retrieve(question, top_k=TOP_K)
+        history = load_history(conv)
+        retrieved, reranked = pipeline.retrieve(question, top_k=TOP_K, rid=rid)
 
         # AI 卡片先上（「执行中」占位）。注意 SDK 的坑：建卡失败是静默的（不抛异常、
         # card_instance_id 留空），必须显式校验，否则废卡会吞掉降级路径
@@ -189,8 +191,10 @@ class RAGBotHandler(dingtalk_stream.ChatbotHandler):
         except Exception as e:
             log.warning("AI 卡片创建失败，降级整条回复：%s", e)
 
-        answer, tokens = generate_stream(self.client, question, history, retrieved, holder["card"])
+        answer, tokens = generate_stream(question, history, retrieved, holder["card"], rid)
         latency_ms = int((time.perf_counter() - t0) * 1000)
+        limits.count_tokens(tokens)
+        trace.record(rid, "e2e", (time.perf_counter() - t0) * 1000, meta={"via": "dingtalk"})
 
         sources = json.dumps([{"i": i, "type": e["type"], "source": e["source"], "page": e["page"]}
                               for i, e in enumerate(retrieved, 1)], ensure_ascii=False)
@@ -208,8 +212,9 @@ class RAGBotHandler(dingtalk_stream.ChatbotHandler):
         else:
             self.reply_markdown("ragbot", reply_md, msg)
             log.info("整条回复 %d 字", len(reply_md))
-        log.info("%s: %s → %d 字 · %dms · %d tokens · rerank%s",
-                 nick, question[:40], len(answer), latency_ms, tokens, "正常" if reranked else "降级")
+        log.info("%s: %s → %d 字 · %dms · %d tokens · rerank%s · rid=%s",
+                 nick, question[:40], len(answer), latency_ms, tokens,
+                 "正常" if reranked else "降级", rid)
 
 
 def bot_main():
@@ -223,9 +228,7 @@ def bot_main():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     client = dingtalk_stream.DingTalkStreamClient(dingtalk_stream.Credential(cid, secret))
-    client.register_callback_handler(dingtalk_stream.ChatbotMessage.TOPIC,
-                                     RAGBotHandler(Anthropic(base_url=llm._CHAT_BASE_URL,
-                                                             api_key=llm._CHAT_API_KEY)))
+    client.register_callback_handler(dingtalk_stream.ChatbotMessage.TOPIC, RAGBotHandler())
     log.info("钉钉机器人已启动（Stream 模式，出站连接免公网）· 等待消息…")
     try:
         client.start_forever()          # 阻塞常驻，网络异常自动重连

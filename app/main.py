@@ -15,12 +15,14 @@ import json
 import os
 import re
 import threading
+import time
 import webbrowser
 from pathlib import Path
 
 from flask import Flask, Response, jsonify, request, send_from_directory
 
-from . import llm, pipeline
+from . import limits, llm, pipeline, trace
+from .llm import StreamedAnswer
 from .store import DATA_DIR, MEDIA_DIR, TOP_K
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -76,8 +78,8 @@ def _sse(event: str, data: dict) -> str:
 
 @app.post("/api/chat")
 def chat():
-    """聊天端点。错误分两层：请求级校验（空消息/空库）走 400 JSON——那时响应头还没定；
-    流一旦开始（响应头已是 text/event-stream）中途出错就只能往下写 SSE error 事件。"""
+    """聊天端点。错误分两层：请求级校验（空消息/空库/超限）走 4xx JSON——那时响应头
+    还没定；流一旦开始（响应头已是 text/event-stream）中途出错就只能写 SSE error。"""
     body = request.get_json(silent=True) or {}
     message = str(body.get("message", "")).strip()
     history = body.get("history") or []
@@ -85,9 +87,15 @@ def chat():
         return jsonify(error="message 不能为空"), 400
     if not pipeline.store.chunk_count():
         return jsonify(error="向量库为空，请先在左侧导入文档"), 400
+    ok, why = limits.allow("web")
+    if not ok:
+        return jsonify(error=why), 429
+    limits.count_question("web")
 
-    retrieved, reranked = pipeline.retrieve(message, top_k=TOP_K)        # 混合检索
-    llm_messages = pipeline.build_user_msg(message, retrieved, history)  # 增强：拼 context
+    rid = trace.new_request_id()
+    t_e2e = time.perf_counter()
+    retrieved, reranked = pipeline.retrieve(message, top_k=TOP_K, rid=rid)     # 混合检索
+    llm_messages = pipeline.build_user_msg(message, retrieved, history)        # 增强：拼 context
     sources_payload = []
     for i, e in enumerate(retrieved, 1):
         m = re.search(r"原图文件：(.+)$", e["content"], re.M) if e["type"] == "image" else None
@@ -100,13 +108,17 @@ def chat():
         })
 
     def stream():
-        yield _sse("sources", {"sources": sources_payload, "reranked": reranked})
+        yield _sse("sources", {"sources": sources_payload, "reranked": reranked, "rid": rid})
         try:
-            for delta in pipeline.generator.answer_stream(llm.SYSTEM_PROMPT, llm_messages):
+            sa = StreamedAnswer(llm.SYSTEM_PROMPT, llm_messages, rid=rid)
+            for delta in sa:
                 yield _sse("delta", {"text": delta})
+            limits.count_tokens(sa.usage)
+            trace.record(rid, "e2e", (time.perf_counter() - t_e2e) * 1000,
+                         meta={"tokens": sa.usage})
             yield _sse("done", {})
         except Exception as e:
-            yield _sse("error", {"message": f"生成失败：{e}\n请确认生成 API Key 已配置"})
+            yield _sse("error", {"message": f"生成失败：{e}\n请稍后重试或联系管理员"})
 
     return Response(stream(), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache"})
