@@ -64,30 +64,35 @@ CASES = [
     {
         "id": "C01", "layer": "常规", "tag": "表格",
         "question": "盐湖股份2024年营业收入和归母净利润分别是多少？",
-        "expect": [{"type": "table", "page": 4}],
+        "expect": [[{"type": "table", "page": 4, "source": "盐湖股份2024年报（精选页）"},
+                    {"type": "table", "page": 4, "source": "盐湖股份2025年报（精选页）"}]],
         "assert_groups": [["15,134,119,500", "151.34"], ["4,663,116,528", "46.63"]],
-        "note": "两组数值（营收 + 净利）都要对",
+        "note": "两组数值（营收 + 净利）都要对；锚定组 OR——2025 表的 2024 对比列"
+               "同样带答案数字，出处不唯一",
     },
     {
         "id": "C02", "layer": "常规", "tag": "表格",
         "question": "盐湖股份2024年归母净利润比上一年下降了多少？",
         "expect": [{"type": "table", "page": 4}],
         "assert_groups": [["41.07"]],
-        "note": "降幅 41.07%",
+        "note": "降幅 41.07%（2025 表的 2024 对比列无此降幅，出处唯一故钉死 2024）",
     },
     {
         "id": "C03", "layer": "常规", "tag": "表格",
         "question": "盐湖股份2024年赚了多少钱？",
-        "expect": [{"type": "table", "page": 4}],
+        "expect": [[{"type": "table", "page": 4, "source": "盐湖股份2024年报（精选页）"},
+                    {"type": "table", "page": 4, "source": "盐湖股份2025年报（精选页）"}]],
         "assert_groups": [["4,663,116,528", "46.63"]],
-        "note": "「赚钱」非字面匹配——语义检索 + 模型把口语映射到净利",
+        "note": "「赚钱」非字面匹配——语义检索 + 模型把口语映射到净利；锚定组 OR"
+               "（2025 表 2024 对比列同带答案）",
     },
     {
         "id": "C04", "layer": "常规", "tag": "表格",
         "question": "盐湖股份2024年基本每股收益是多少？",
-        "expect": [{"type": "table", "page": 4}],
+        "expect": [[{"type": "table", "page": 4, "source": "盐湖股份2024年报（精选页）"},
+                    {"type": "table", "page": 4, "source": "盐湖股份2025年报（精选页）"}]],
         "assert_groups": [["0.8812", "0.88"]],
-        "note": "每股收益 0.8812 元",
+        "note": "每股收益 0.8812 元；锚定组 OR（2025 表 2024 对比列同带答案）",
     },
     {
         "id": "C05", "layer": "常规", "tag": "表格",
@@ -111,9 +116,12 @@ CASES = [
     {
         "id": "C07", "layer": "常规", "tag": "正文",
         "question": "全球钾肥产能主要集中在哪几家公司？",
-        "expect": [{"type": "text", "kw": "Nutrien"}],
+        "expect": [[{"type": "text", "kw": "Nutrien", "source": "盐湖股份2024年报（精选页）"},
+                    {"type": "text", "kw": "Nutrien", "source": "盐湖股份2023年报（精选页）"},
+                    {"type": "text", "kw": "Nutrien", "source": "盐湖股份2025年报（精选页）"}]],
         "assert_groups": [["Nutrien"]],
-        "note": "五寡头：Nutrien / Belaruskali / Uralkali / Mosaic / K+S",
+        "note": "五寡头：Nutrien / Belaruskali / Uralkali / Mosaic / K+S；三年版同事实，"
+               "锚定组 OR",
     },
     {
         "id": "C08", "layer": "常规", "tag": "正文+图片",
@@ -162,11 +170,14 @@ CASES = [
     },
     {
         "id": "B04", "layer": "边界", "tag": "表格+正文",
-        "question": "盐湖股份的董事长是谁？",
-        "expect": [{"type": "table", "page": 3}, {"type": "text", "kw": "侯昭飞"}],
+        "question": "盐湖股份2024年的董事长是谁？",
+        "expect": [[{"type": "table", "kw": "侯昭飞", "source": "盐湖股份2024年报（精选页）"},
+                    {"type": "table", "kw": "侯昭飞", "source": "盐湖股份2025年报（精选页）"}]],
         "assert_groups": [["侯昭飞"]],
         "note": "措辞转换：语料里没有「董事长」，只有「法定代表人：侯昭飞」（p3 表格）"
-               "——考检索的同义锚定 + 模型把法定代表人接到董事长上的接地推理",
+               "——考检索的同义锚定 + 模型把法定代表人接到董事长上的接地推理。"
+               "10-29 pin 年份：2023 版法定代表人是贠红卫，不 pin 年份答案不唯一；"
+               "2024/2025 版同人，锚定组 OR",
     },
     {
         "id": "B05", "layer": "边界", "tag": "正文",
