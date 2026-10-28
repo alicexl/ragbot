@@ -2,9 +2,8 @@
 
 key 拓扑（拆分背景：生成商可独立切换，检索侧固定智谱）：
 - ANTHROPIC_API_KEY → 智谱 Key：embedding-3 / rerank / VLM（glm-4v-flash）走智谱原生 API
-- CHAT_API_KEY      → 生成专用：默认复用智谱 glm-5.3（anthropic 兼容网关），
-  也可指向 DeepSeek（https://api.deepseek.com/anthropic + deepseek-flash），
-  配 ANTHROPIC_BASE_URL / ANTHROPIC_CHAT_MODEL 两个 env 即完成切换
+- CHAT_API_KEY      → 生成专用：固定 DeepSeek anthropic 兼容端点（deepseek-flash，
+  实测快 4 倍且评测持平）；配 ANTHROPIC_BASE_URL / ANTHROPIC_CHAT_MODEL 两个 env 可换别家
 """
 
 import base64
@@ -20,9 +19,9 @@ log = logging.getLogger("ragbot.llm")
 
 API_KEY = ""   # 没设 env 时的兜底（推荐环境变量，免改代码）
 
-_CHAT_BASE_URL = os.environ.get("ANTHROPIC_BASE_URL", "https://open.bigmodel.cn/api/anthropic")
-_CHAT_MODEL = os.environ.get("ANTHROPIC_CHAT_MODEL", "glm-5.3")
-_CHAT_API_KEY = os.environ.get("CHAT_API_KEY") or os.environ.get("ANTHROPIC_API_KEY") or API_KEY
+_CHAT_BASE_URL = os.environ.get("ANTHROPIC_BASE_URL", "https://api.deepseek.com/anthropic")
+_CHAT_MODEL = os.environ.get("ANTHROPIC_CHAT_MODEL", "deepseek-flash")
+_CHAT_API_KEY = os.environ.get("CHAT_API_KEY") or API_KEY
 _ZHIPU_API_KEY = os.environ.get("ANTHROPIC_API_KEY") or API_KEY
 
 _ZHIPU_EMBED_URL = "https://open.bigmodel.cn/api/paas/v4/embeddings"

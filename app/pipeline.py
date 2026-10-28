@@ -30,7 +30,7 @@ def init(db_path: str | None = None):
         raise SystemExit("未配置智谱 API Key（ANTHROPIC_API_KEY）——embedding/rerank/VLM 都依赖它")
     generator = llm.Generator()
     if not generator.api_key:
-        raise SystemExit("未配置生成 API Key（CHAT_API_KEY 或 ANTHROPIC_API_KEY）")
+        raise SystemExit("未配置生成 API Key（CHAT_API_KEY）")
     embedder = llm.ZhipuEmbedder(llm._ZHIPU_API_KEY)
     splitter = RecursiveTextSplitter(chunk_size=400, chunk_overlap=50)
     reranker = llm.Reranker(llm._ZHIPU_API_KEY)

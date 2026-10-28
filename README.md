@@ -2,7 +2,7 @@
 
 文档入库（PDF 正文 / 表格 / 图片三模态）→ 混合检索（稠密向量 + BM25 两路召回、RRF 融合、Cross-Encoder 精排）→ 流式生成。**Web 聊天（SSE 打字机）+ 钉钉机器人（Stream 模式免公网）双客户端**，带完整的生产化横切面：评测集、请求级追踪、超时/有限重试/降级、限流与 token 预算、压测数据。
 
-> 源于教学项目 [Mini-RAG](https://github.com/alicexl/Mini-RAG)（四步从零搭 RAG 的原理线）；本仓是其中产品线的独立演化——检索/解析内核经过 Mini-RAG 全链路验证后迁来，围绕「能上线」补齐工程横切面。
+> 源于教学项目 [Mini-RAG](https://github.com/alicexl/Mini-RAG)（三步从零搭 RAG 的原理线）；本仓是其原 step4 应用的产品线独立演化——检索/解析内核在 Mini-RAG 内完成 E2E 与评测验证后迁出，围绕「能上线」补齐工程横切面。
 
 ## 架构
 
@@ -20,7 +20,7 @@
    横切面：trace（request_id + span 落 SQLite）· limits（按人日限 + token 日预算）
 ```
 
-**模型拓扑**（key 拆分，生成商可独立切换）：智谱 embedding-3 / rerank / glm-4v（检索侧固定）+ 生成走 anthropic 兼容端点（默认智谱 glm-5.3，env 三件套可切 DeepSeek——本项目实测 deepseek-flash 快 4 倍且评测持平，见下）。
+**模型拓扑**（key 拆分）：智谱 embedding-3 / rerank / glm-4v（检索侧固定）+ 生成固定 DeepSeek anthropic 兼容端点（deepseek-flash，实测快 4 倍且评测持平，见下）。
 
 ## 关键指标（真实跑出来的，复现命令都在本仓）
 
@@ -65,8 +65,7 @@
 ```bash
 pip install -r requirements.txt
 set ANTHROPIC_API_KEY=你的智谱key        # 检索侧三件（embedding/rerank/VLM）
-# 可选：生成切 DeepSeek（实测快 4 倍、评测持平）
-set CHAT_API_KEY=你的deepseekkey
+set CHAT_API_KEY=你的deepseekkey          # 生成固定 DeepSeek（实测快 4 倍、评测持平）
 set ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
 set ANTHROPIC_CHAT_MODEL=deepseek-flash
 
@@ -97,7 +96,7 @@ nssm start ragbot
 
 ## 演进记录（都有评测数字背书）
 
-- 生成选型三轮：glm-5.3 → glm-5.3-flash（评测否决：更慢且质量掉）→ deepseek-flash（生成 5.9s→1.4s、P95 19.8s→2.7s、token 省 63%，质量持平）——「用评测而不是感觉做技术决策」的完整样本
+- 生成选型三轮：glm-5.3 → glm-5.3-flash（评测否决：更慢且质量掉）→ deepseek-flash（生成 5.9s→1.4s、P95 19.8s→2.7s、token 省 63%，质量持平）——「用评测而不是感觉做技术决策」的完整样本；10-29 定案只保留 DeepSeek，代码默认与文档同口径
 - 评测加固（10-29）：异常题加 refute 负向断言（「未提及，但 KCl」照样判错）、生成探针改走与线上同段流式代码、库内加虚构公司干扰文档、评测迁独立库 data/eval.db（无需停服务、不碰生产库）——重测检索 76.5% 持平、答对 ≈70%（旧口径 76.5% 系单轮幸运值，两轮复跑确认波动在边界题）、拒绝 100% 零编造
 - 钉钉打字机三要素（首帧置 INPUTING / 中间帧直发 / isFinalize 终帧），缺一不可——SDK 的 `ai_streaming` 永不收尾，卡片会挂在流式会话只渲染第一帧
 
