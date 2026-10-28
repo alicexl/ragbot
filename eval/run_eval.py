@@ -23,7 +23,7 @@ from pathlib import Path
 
 from app import llm, pipeline, trace
 from app.store import DATA_DIR, TOP_K
-from eval.evalset import CASES, REFUSE_PATTERNS
+from eval.evalset import CASES, EVAL_SOURCE, REFUSE_PATTERNS
 
 EVAL_DB = str(DATA_DIR / "eval.db")                           # 评测独立库，与生产隔离
 SAMPLE_DIR = Path(__file__).parent.parent / "sample_reports"  # 样本 PDF（多放即多干扰文档）
@@ -37,7 +37,11 @@ def _percentile(xs: list[float], p: int) -> float:
 
 
 def _match(entry: dict, cand: dict) -> bool:
-    """检索层命中判定：表格/图片候选按 类型+页码，正文候选按 类型+关键词锚定"""
+    """检索层命中判定：只认评测主语料（EVAL_SOURCE）的块——多文档库中表格/图片
+    按 类型+页码、正文按 类型+关键词锚定，但都必须出自同一来源，否则 2023/2025/
+    云天化的同页码表格会假命中。"""
+    if entry["source"] != EVAL_SOURCE:
+        return False
     if entry["type"] != cand["type"]:
         return False
     if "kw" in cand:
@@ -82,6 +86,8 @@ def main():
     ap = argparse.ArgumentParser(description="ragbot 评测")
     ap.add_argument("--runs", type=int, default=3,
                     help="每条 case 的生成次数（pass@N / pass^N 的 N，默认 3）")
+    ap.add_argument("--top-k", type=int, default=TOP_K,
+                    help="检索进生成 context 的条数（默认=生产常量 TOP_K；仅评测实验，不改生产）")
     args = ap.parse_args()
 
     pipeline.init(db_path=EVAL_DB)
@@ -93,11 +99,12 @@ def main():
     n_refuse = len(CASES) - n_do
     print("=" * 68)
     print(f"ragbot 评测 · 独立库 {pipeline.store.chunk_count()} 块（含干扰文档）"
-          f" · 评测集 {len(CASES)} 条（该做 {n_do} / 不该做 {n_refuse}）· 每条生成 {args.runs} 次")
+          f" · 评测集 {len(CASES)} 条（该做 {n_do} / 不该做 {n_refuse}）· 每条生成 {args.runs} 次"
+          f" · context Top-{args.top_k}")
     print("=" * 68)
 
     rows = []
-    ret_hits = ret_top1 = ret_runs = 0
+    ret_hits = ret_hits_n = ret_top1 = ret_runs = 0
     ret_by_layer: dict[str, list[int]] = {}
     gen_pass = gen_runs = 0
     refuse_pass = refuse_runs = 0
@@ -112,18 +119,20 @@ def main():
         k_passed = 0
         for _ in range(args.runs):
             t0 = time.perf_counter()
-            retrieved, reranked = pipeline.retrieve(case["question"], top_k=TOP_K)
+            retrieved, reranked = pipeline.retrieve(case["question"], top_k=args.top_k)
             ret_ms.append((time.perf_counter() - t0) * 1000)
             degraded += (not reranked)
 
             if case["expect"] is not None:
                 ret_runs += 1
                 ret_by_layer.setdefault(case["layer"], [0, 0])[1] += 1
-                hit = any(_match(e, c) for e in retrieved for c in case["expect"])
+                hit = any(_match(e, c) for e in retrieved[:3] for c in case["expect"])   # 历史口径 @3
+                hit_n = any(_match(e, c) for e in retrieved for c in case["expect"])     # 上下文口径 @N
                 top1 = any(_match(retrieved[0], c) for c in case["expect"])
                 ret_hits += hit
+                ret_hits_n += hit_n
                 ret_top1 += top1
-                if hit:
+                if hit_n:
                     hit_any = True
                     ret_by_layer[case["layer"]][0] += 1
                 top1_any = top1_any or top1
@@ -145,7 +154,7 @@ def main():
 
         rows.append((case, hit_any, top1_any, k_passed))
         ret_mark = "—" if case["expect"] is None else \
-            ("✓Top1" if top1_any else ("✓@3" if hit_any else "✗"))
+            ("✓Top1" if top1_any else (f"✓@{args.top_k}" if hit_any else "✗"))
         print(f"  {case['id']} [{case['layer']}·{case['tag']}] 检索 {ret_mark}"
               f" · 生成 {k_passed}/{args.runs} · {case['note'].split('，')[0].split('：')[0]}")
 
@@ -156,6 +165,7 @@ def main():
     print("=" * 68)
     print("检索层（标准出处进 Top-3 判命中；异常题无标准出处，不判）")
     print(f"  命中@3  {ret_hits}/{ret_runs}（{ret_hits / ret_runs:.1%}）"
+          f" · 命中@{args.top_k}  {ret_hits_n}/{ret_runs}（{ret_hits_n / ret_runs:.1%}）"
           f" · Top-1  {ret_top1}/{ret_runs}（{ret_top1 / ret_runs:.1%}）")
     print("  分层（按 run 计）：" + " · ".join(
         f"{k} {v[0]}/{v[1]}" for k, v in ret_by_layer.items()))

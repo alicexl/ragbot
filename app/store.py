@@ -19,7 +19,8 @@ DATA_DIR = Path(__file__).parent.parent / "data"      # 向量库 + 图片原件
 MEDIA_DIR = DATA_DIR / "media"                        # 图片原件（chunk 只存文件名，前端经 /api/media/ 回显）
 
 RECALL_K = 20     # 粗排宽进捞多少
-TOP_K = 3         # 精排收紧留几条（进生成 context 的条数）
+TOP_K = 5         # 精排收紧留几条（进生成 context 的条数；10-29 多文档后 3→5：
+                  # 评测两轮 命中@5 58.8% vs @3 47.1%，检索稳定 +11.7pp）
 RRF_K = 60        # RRFRanker 的 k
 
 
