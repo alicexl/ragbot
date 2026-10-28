@@ -94,7 +94,6 @@ nssm start ragbot
 
 ## 演进记录（都有评测数字背书）
 
-- 检索嵌入从本地 Ollama（GTX970，单查 2.2s）换智谱 embedding-3：检索 2.7s → 0.9s，命中@3 持平 76.9%
 - 生成选型三轮：glm-5.3 → glm-5.3-flash（评测否决：更慢且质量掉）→ deepseek-flash（生成 5.9s→1.4s、P95 19.8s→2.7s、token 省 63%，质量持平）——「用评测而不是感觉做技术决策」的完整样本
 - 钉钉打字机三要素（首帧置 INPUTING / 中间帧直发 / isFinalize 终帧），缺一不可——SDK 的 `ai_streaming` 永不收尾，卡片会挂在流式会话只渲染第一帧
 
