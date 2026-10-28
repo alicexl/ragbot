@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Mini-RAG · 问答助手</title>
+<title>ragbot · 文档问答</title>
 <style>
   * { box-sizing: border-box; }
   body {
@@ -60,8 +60,8 @@
 </head>
 <body>
 <header>
-  <h1>Mini-RAG · 问答助手</h1>
-  <p>把 Step 1-4 的 RAG 做成一个能用的聊天产品。</p>
+  <h1>ragbot · 文档问答</h1>
+  <p>多模态 RAG 问答服务：文档入库（PDF 表格/图片）、混合检索 + rerank、流式生成。</p>
 </header>
 <main>
   <!-- 左栏：文档管理 -->
@@ -72,7 +72,7 @@
     <label for="file" class="btn primary">导入</label>
     <button id="clear" class="btn danger">清空</button>
     <div id="upload-note"></div>
-    <p class="hint">示例语料在 step4_app/sample_reports/（年报精选页 PDF 含表格图片，md 节选为纯文本）</p>
+    <p class="hint">示例语料在 sample_reports/（年报精选页 PDF 含表格图片，md 节选为纯文本）</p>
   </aside>
 
   <!-- 右栏：来源 + 聊天 + 输入 -->
