@@ -59,11 +59,22 @@ def _expect_groups(case: dict) -> list[list[dict]]:
 
 def _score_answer(answer: str, case: dict) -> bool:
     """生成层判分：普通题 = 每组关键词任一命中、全部组通过；
-    异常题 = 拒答词命中 且 没有带出 refute 编造关键词（拒答后接着编造照样判错）"""
+    异常题 = 拒答 且 拒答句之后没有编造内容。refute 命中只看拒答句之后——
+    拒答句内的命中是元语言解释（「未提及…发展战略…等内容」），不是编造。
+    （10-30 X01 复盘：模型实际 15/15 拒答，eval fail 全是旧判分把元语言当编造的假阳性）"""
     if case["assert_groups"] is None:
-        refuse = any(p in answer for p in REFUSE_PATTERNS)
-        leak = any(r.lower() in answer.lower() for r in case.get("refute", []))
-        return refuse and not leak
+        refuse_at = [answer.find(p) for p in REFUSE_PATTERNS if p in answer]
+        if not refuse_at:
+            return False
+        first = min(refuse_at)
+        sent_end = len(answer)
+        for stop in "。！？":
+            pos = answer.find(stop, first)
+            if pos != -1:
+                sent_end = min(sent_end, pos + 1)   # 拒答句边界（含句末标点）
+        leak = any(r.lower() in answer[sent_end:].lower()
+                   for r in case.get("refute", []))
+        return not leak
     return all(any(k in answer for k in group) for group in case["assert_groups"])
 
 
