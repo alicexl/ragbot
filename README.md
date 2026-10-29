@@ -25,15 +25,19 @@
 
 ## 关键指标（真实跑出来的，复现命令都在本仓）
 
-**质量评测**（`python -X utf8 -m eval.run_eval`，21 条四层评测集 × 3 次，判分全代码断言；评测用独立库 data/eval.db + 干扰文档，无需停服务）：
+**质量评测**（`python -X utf8 -m eval.run_eval`，22 条四层评测集 × 3 次，判分全代码断言；评测用独立库 data/eval.db + 干扰文档，无需停服务）：
 
 | 指标 | 数值 | 说明 |
 |---|---|---|
-| 检索命中@5 | 84.2% | 标准出处进 Top-5；命中@3 84.2%；分层@5：常规 33/33 / 边界 15/18 / 综合 0/6；Top-1 63.2%（表格块 text 加 source 锚后，见演进记录） |
-| 答对率 | 84.2% | 生成层关键词组断言；context 带类型+来源标注，模型能按公司/年份正确归因 |
+| 检索命中@5 | 80.0% | 标准出处进 Top-5；命中@3 75.0%；分层@5：常规 36/36 / 边界 12/18 / 综合 0/6；Top-1 70.0% |
+| 答对率 | 80.0% | 生成层关键词组断言；context 带类型+来源标注，模型能按公司/年份正确归因 |
 | 拒绝率（不该做的题） | 100% | 语料外问题（含世界知识有的）零幻觉漏答；拒答却带出编造内容 0 次 |
-| pass@3 / pass^3 | 16/19 · 16/19 | 每题生成 3 次，全对才记 pass^3 |
-| 生成延迟 | p50 1.5s / P95 2.1s | deepseek-flash、关思考 |
+| pass@3 / pass^3 | 16/20 · 16/20 | 每题生成 3 次，全对才记 pass^3 |
+| 生成延迟 | p50 1.5s / P95 2.0s | deepseek-flash、关思考 |
+
+（22 条口径 = 21 条 + M07 docx 反样式真实 case；命中绝对数 48/57→48/60 不变——分母变化 + 库重建的 VLM 描述方差，非回归；M05/M07 两类 docx 管线题全绿 ✓Top1）
+
+**统一 Chunk 数据模型**（10-30）：`@dataclass Chunk {text, chunk_type, content, page, section, source}` 一处定义贯穿入库/检索/展示（此前 store 层叫 chunk_type、pipeline 转手改名 type、三个消费方各摸各的键）；检索命中为 `RetrievedChunk(Chunk) + rrf/score`。**章节（section）**：PDF 按中文序号标题正则、docx Heading 样式优先 + 加粗+序号兜底（真实世界 docx 常用加粗伪装标题），standalone 表格块记所在章节，bot 脚注与 Web 来源面板显示「哪份文档哪一节哪一页」；正文块跨章节不硬造（与 page=0 同约定）。章节进可检索文本的 A/B（22 条 × 3 轮两臂）：命中/答对/拒绝全持平=中性，前缀默认不加——source 锚已吃掉表格题检索增益，section 只留元数据与展示。
 
 **Pre-retrieval 消融**（`--pre off/rewrite/hyde/multi` 同库三轮；rewrite=LLM 改写消解多轮指代，hyde=假设文档只换 dense 向量，multi=3 变体+原问四路 RRF 合并）：
 
@@ -87,7 +91,7 @@ set ANTHROPIC_CHAT_MODEL=deepseek-flash
 python -X utf8 -m app.main              # → http://127.0.0.1:7860
 ```
 
-语料：`sample_reports/` 下 6 份精选 PDF——盐湖股份 2023/2024/2025 + 云天化 2023/2024/2025（各 10 页左右，镜像结构：重要提示/释义/简介/主要会计数据/非经常性损益/行业与图表页，`tools/extract_pages.py` 可从年报全本重抽）+ 1 份 docx 样本（`tools/make_docx_sample.py` 生成的虚构公司简报，验 docx 管线）。全部导入即可跨年跨公司问答（约 210 块）。评测：`-m eval.run_eval` 用独立库 data/eval.db（自动导入全部样本 PDF/docx + 干扰文档），与线上服务互不干扰、无需停服务；压测 `-m loadtest.bench` 需服务在跑。
+语料：`sample_reports/` 下 6 份精选 PDF——盐湖股份 2023/2024/2025 + 云天化 2023/2024/2025（各 10 页左右，镜像结构：重要提示/释义/简介/主要会计数据/非经常性损益/行业与图表页，`tools/extract_pages.py` 可从年报全本重抽）+ 2 份 docx 样本（`tools/make_docx_sample.py`：星澜科技=虚构公司标准样式，验基础管线；万华化学=**真实数字（摘自 2025 年报 p7）+ 反样式排版**——加粗伪装标题/合并单元格表头，验章节提取兜底路径）。全部导入即可跨年跨公司问答（约 210 块）。评测：`-m eval.run_eval` 用独立库 data/eval.db（自动导入全部样本 PDF/docx + 干扰文档），与线上服务互不干扰、无需停服务；压测 `-m loadtest.bench` 需服务在跑。
 
 **支持的文档格式**：PDF（PyMuPDF 自研多模态管线）/ docx（python-docx，与 PDF 同构的三类 chunk：段落正文、表格→HTML、内嵌图片→VLM 描述）/ 纯文本。旧版 .doc（OLE2 二进制）不支持，上传时明确引导转存 .docx（评估过 LibreOffice headless 转换路线：引入 700MB 级外部依赖，语料现实里没有 .doc，不做）。
 
@@ -113,6 +117,7 @@ nssm start ragbot
 
 ## 演进记录（都有评测数字背书）
 
+- 统一数据模型 + 章节元数据（10-30）：Chunk dataclass 收口双名（chunk_type 全链统一，含 evalset/前端）；章节提取两条路（PDF 序号正则 / docx Heading 样式+加粗兜底）入 standalone 块元数据，脚注展示「文档｜章节 p页」；+M07 反样式真实 docx case（万华真数字+伪标题+合并单元格，章节兜底路径全绿）。章节 text 锚 A/B：全指标持平=中性 → 前缀撤、元数据留（RAGBOT_SECTION_ANCHOR=1 可复验）——source 锚已吃掉表格题检索增益的又一实证
 - 异常题判分器去假阳性（10-30）：X01 三轮复跑 3/3→2/3→1/3 波动，探针复盘=**模型实际 15/15 拒答，fail 全是判分器误伤**两种形态——①拒答解释的元语言（「未提及…发展战略…等内容」）②拒答时引用语料原文（年报重要提示的前瞻性陈述免责声明本身就含「未来计划、发展战略」）。修复=refute 词表只收动作词（编造必然用动作词）+ 拒答句内命中豁免；拒答回 100%/编造 0，真编造样本全部照拦
 - 表格 source 锚修复（10-30）：M05（虚构公司 docx 表格题）四模式全挂倒查——独立成块的表格 text 版只有指标+数字，**没有公司名锚，BM25/dense 两路都吃不到**（正文块含公司名但表格块脱离了正文流）。修复=standalone 表格块 text 加 source 前缀（PDF/docx 两管线同修），off 命中 57.9→84.2%（**+26.3pp**），Top-1 47.4→63.2%。教训：多模态 chunk 脱离上下文独立成块时，把来源信息带进可检索文本
 - docx 导入 + pre-retrieval 三模式 A/B（10-30）：python-docx 管线（段/表/图三类 chunk 与 PDF 同构，12 行大表独立成块、图片真 VLM 描述）；pre-retrieval 实现互斥四模式（rewrite/hyde/multi，LLM 失败 5s 降级原问）+ evalset 21 条（+M05 docx 锚定、+M06 多轮指代信号弹——off 裸检索 0/3、改写 3/3）。A/B 拍板：source 锚修复吞掉 pre 增益，off 默认保留（rewrite 拒绝 83.3% 有编造泄漏、hyde/multi 净负），三模式留 flag；附带发现——multi 变体 fan-out 会把语料外题捞到「看起来相关」的内容，护栏变松

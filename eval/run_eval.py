@@ -37,17 +37,17 @@ def _percentile(xs: list[float], p: int) -> float:
     return xs[min(len(xs) - 1, int(0.01 * p * len(xs)))]
 
 
-def _match(entry: dict, cand: dict) -> bool:
+def _match(entry, cand: dict) -> bool:
     """检索层命中判定：默认只认评测主语料（EVAL_SOURCE）的块——多文档库中表格/
     图片按 类型+页码、正文按 类型+关键词锚定，但都必须出自同一来源，否则
     2023/2025/云天化的同页码表格会假命中。候选带 source 时以其为准（锚定新语料）。"""
-    if entry["source"] != cand.get("source", EVAL_SOURCE):
+    if entry.source != cand.get("source", EVAL_SOURCE):
         return False
-    if entry["type"] != cand["type"]:
+    if entry.chunk_type != cand["chunk_type"]:
         return False
     if "kw" in cand:
-        return cand["kw"] in entry["text"]
-    return entry["page"] == cand["page"]
+        return cand["kw"] in entry.text
+    return entry.page == cand["page"]
 
 
 def _expect_groups(case: dict) -> list[list[dict]]:

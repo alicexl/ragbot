@@ -1,13 +1,13 @@
-"""评测集 v5：21 条 case，四层设计（对齐「评测集怎么建」的三条经验 + 真实回流）
+"""评测集 v5：22 条 case，四层设计（对齐「评测集怎么建」的三条经验 + 真实回流）
 
 题型分类约束（构造题与真实回流题一视同仁）：优先归 A 明确标准题 / B 多文档
 综合题 / C 目标缺失歧义题，不能归类的进 D 其它（本集 X01/X02 语料外拒答题
 即 D）。C 类不入集——澄清反问是 bot 产品功能，当前不存在；无唯一答案的题不入集。
 
 分层（场景维度）：
-- 常规 11 条：语料里有、问法直白——RAG 应该拿分的基本盘（含 2 条锚定新语料的
-  2025 盐湖/云天化题 expect 带 source 覆盖 EVAL_SOURCE；+1 条锚定 docx 语料的
-  M05——docx 解析管线的验收题）
+- 常规 12 条：语料里有、问法直白——RAG 应该拿分的基本盘（含 2 条锚定新语料的
+  2025 盐湖/云天化题 expect 带 source 覆盖 EVAL_SOURCE；M05 docx 样式排版验收、
+  M07 docx 反样式真实 case——真数字+加粗伪装标题+合并单元格，验章节兜底路径）
 - 边界 6 条：短查询 / 跨块聚合 / 图片定性 / 措辞转换 / 答案埋在行政文本 /
   多轮指代（M06 带 history——pre-retrieval A/B 的信号弹：off 模式裸检索
   「那2025年呢」必挂，rewrite 消解指代后应过）
@@ -66,8 +66,8 @@ CASES = [
     {
         "id": "C01", "layer": "常规", "tag": "表格",
         "question": "盐湖股份2024年营业收入和归母净利润分别是多少？",
-        "expect": [[{"type": "table", "page": 4, "source": "盐湖股份2024年报（精选页）"},
-                    {"type": "table", "page": 4, "source": "盐湖股份2025年报（精选页）"}]],
+        "expect": [[{"chunk_type": "table", "page": 4, "source": "盐湖股份2024年报（精选页）"},
+                    {"chunk_type": "table", "page": 4, "source": "盐湖股份2025年报（精选页）"}]],
         "assert_groups": [["15,134,119,500", "151.34"], ["4,663,116,528", "46.63"]],
         "note": "两组数值（营收 + 净利）都要对；锚定组 OR——2025 表的 2024 对比列"
                "同样带答案数字，出处不唯一",
@@ -75,15 +75,15 @@ CASES = [
     {
         "id": "C02", "layer": "常规", "tag": "表格",
         "question": "盐湖股份2024年归母净利润比上一年下降了多少？",
-        "expect": [{"type": "table", "page": 4}],
+        "expect": [{"chunk_type": "table", "page": 4}],
         "assert_groups": [["41.07"]],
         "note": "降幅 41.07%（2025 表的 2024 对比列无此降幅，出处唯一故钉死 2024）",
     },
     {
         "id": "C03", "layer": "常规", "tag": "表格",
         "question": "盐湖股份2024年赚了多少钱？",
-        "expect": [[{"type": "table", "page": 4, "source": "盐湖股份2024年报（精选页）"},
-                    {"type": "table", "page": 4, "source": "盐湖股份2025年报（精选页）"}]],
+        "expect": [[{"chunk_type": "table", "page": 4, "source": "盐湖股份2024年报（精选页）"},
+                    {"chunk_type": "table", "page": 4, "source": "盐湖股份2025年报（精选页）"}]],
         "assert_groups": [["4,663,116,528", "46.63"]],
         "note": "「赚钱」非字面匹配——语义检索 + 模型把口语映射到净利；锚定组 OR"
                "（2025 表 2024 对比列同带答案）",
@@ -91,17 +91,17 @@ CASES = [
     {
         "id": "C04", "layer": "常规", "tag": "表格",
         "question": "盐湖股份2024年基本每股收益是多少？",
-        "expect": [[{"type": "table", "page": 4, "source": "盐湖股份2024年报（精选页）"},
-                    {"type": "table", "page": 4, "source": "盐湖股份2025年报（精选页）"}]],
+        "expect": [[{"chunk_type": "table", "page": 4, "source": "盐湖股份2024年报（精选页）"},
+                    {"chunk_type": "table", "page": 4, "source": "盐湖股份2025年报（精选页）"}]],
         "assert_groups": [["0.8812", "0.88"]],
         "note": "每股收益 0.8812 元；锚定组 OR（2025 表 2024 对比列同带答案）",
     },
     {
         "id": "C05", "layer": "常规", "tag": "表格",
         "question": "盐湖股份年报里，「公司」指的是哪家企业？",
-        "expect": [[{"type": "table", "kw": "青海盐湖工业", "source": "盐湖股份2024年报（精选页）"},
-                    {"type": "table", "kw": "青海盐湖工业", "source": "盐湖股份2023年报（精选页）"},
-                    {"type": "table", "kw": "青海盐湖工业", "source": "盐湖股份2025年报（精选页）"}]],
+        "expect": [[{"chunk_type": "table", "kw": "青海盐湖工业", "source": "盐湖股份2024年报（精选页）"},
+                    {"chunk_type": "table", "kw": "青海盐湖工业", "source": "盐湖股份2023年报（精选页）"},
+                    {"chunk_type": "table", "kw": "青海盐湖工业", "source": "盐湖股份2025年报（精选页）"}]],
         "assert_groups": [["青海盐湖工业股份有限公司"]],
         "note": "简称「盐湖股份」→ 全称「青海盐湖工业股份有限公司」。10-29 多文档适配："
                "问句 pin 盐湖（原「年报里的公司」6 文档下无唯一指向）；pin 后检索面变成"
@@ -110,7 +110,7 @@ CASES = [
     {
         "id": "C06", "layer": "常规", "tag": "正文",
         "question": "2024年我国钾肥的进口依存度大概是多少？",
-        "expect": [{"type": "text", "kw": "进口依存度"}],
+        "expect": [{"chunk_type": "text", "kw": "进口依存度"}],
         "assert_groups": [["67"]],
         "note": "常年高于 50%，2024 年达 67%；10-29 问句 pin 年份（时变指标，2023 版"
                "只写「超过半」无竞争数字，但无年份问法不唯一）",
@@ -118,9 +118,9 @@ CASES = [
     {
         "id": "C07", "layer": "常规", "tag": "正文",
         "question": "全球钾肥产能主要集中在哪几家公司？",
-        "expect": [[{"type": "text", "kw": "Nutrien", "source": "盐湖股份2024年报（精选页）"},
-                    {"type": "text", "kw": "Nutrien", "source": "盐湖股份2023年报（精选页）"},
-                    {"type": "text", "kw": "Nutrien", "source": "盐湖股份2025年报（精选页）"}]],
+        "expect": [[{"chunk_type": "text", "kw": "Nutrien", "source": "盐湖股份2024年报（精选页）"},
+                    {"chunk_type": "text", "kw": "Nutrien", "source": "盐湖股份2023年报（精选页）"},
+                    {"chunk_type": "text", "kw": "Nutrien", "source": "盐湖股份2025年报（精选页）"}]],
         "assert_groups": [["Nutrien"]],
         "note": "五寡头：Nutrien / Belaruskali / Uralkali / Mosaic / K+S；三年版同事实，"
                "锚定组 OR",
@@ -128,7 +128,7 @@ CASES = [
     {
         "id": "C08", "layer": "常规", "tag": "正文+图片",
         "question": "2024年全球锂矿储量的分布情况如何？前几名的占比是多少？",
-        "expect": [{"type": "image", "page": 10}, {"type": "text", "kw": "锂矿储量"}],
+        "expect": [{"chunk_type": "image", "page": 10}, {"chunk_type": "text", "kw": "锂矿储量"}],
         "assert_groups": [["智利"], ["33.2", "33%", "34%"]],
         "note": "正文（USGS 数据）与饼图（VLM 描述）双候选，考模态互补；10-29 问句 pin"
                "年份——2023 版有「截至2022年 13839 万吨」竞争版本，无年份问法不唯一",
@@ -136,37 +136,46 @@ CASES = [
     {
         "id": "M03", "layer": "常规", "tag": "表格",
         "question": "盐湖股份2025年归母净利润比2024年增长了多少？",
-        "expect": [{"type": "table", "page": 4, "source": "盐湖股份2025年报（精选页）"}],
+        "expect": [{"chunk_type": "table", "page": 4, "source": "盐湖股份2025年报（精选页）"}],
         "assert_groups": [["81.76"]],
         "note": "新语料锚定（source 覆盖 EVAL_SOURCE）：2025 表自带 2024 对比列，增速 81.76%",
     },
     {
         "id": "M04", "layer": "常规", "tag": "表格",
         "question": "云天化2025年的营业收入是多少？",
-        "expect": [{"type": "table", "page": 4, "source": "云天化2025年报（精选页）"}],
+        "expect": [{"chunk_type": "table", "page": 4, "source": "云天化2025年报（精选页）"}],
         "assert_groups": [["48,414,923,741", "484.15"]],
         "note": "云天化侧标准题：2025 营收 484.15 亿（同比 -21.47%）",
     },
     {
         "id": "M05", "layer": "常规", "tag": "表格",
         "question": "星澜科技2025年营业收入是多少？",
-        "expect": [{"type": "table", "kw": "876,543,200", "source": "星澜科技2025年度简报"}],
+        "expect": [{"chunk_type": "table", "kw": "876,543,200", "source": "星澜科技2025年度简报"}],
         "assert_groups": [["876,543,200", "8.77"]],
         "note": "docx 管线验收题：python-docx 解析的 12 行大表独立成 table chunk"
                "（source 锚定 docx 语料；星澜为虚构公司，数字与真语料零重合）",
+    },
+    {
+        "id": "M07", "layer": "常规", "tag": "表格",
+        "question": "万华化学2025年营业收入是多少？",
+        "expect": [{"chunk_type": "table", "kw": "203,234,573", "source": "万华化学2025年度简报"}],
+        "assert_groups": [["203,234,573,814", "203.23"]],
+        "note": "docx 反样式真实 case：真数字（摘自万华 2025 年报 p7）+ 无 Heading 样式"
+               "排版（加粗伪装标题）+ 合并单元格表头——章节提取兜底路径（加粗+序号"
+               "正则）的验收题；万华为语料外真公司，答案唯一",
     },
     # ---------------- 边界：加压形态（5 条） ----------------
     {
         "id": "B01", "layer": "边界", "tag": "正文+图片",
         "question": "我国新能源汽车的销售渗透率是多少？",
-        "expect": [{"type": "text", "kw": "渗透率"}, {"type": "image", "page": 10}],
+        "expect": [{"chunk_type": "text", "kw": "渗透率"}, {"chunk_type": "image", "page": 10}],
         "assert_groups": [["45.8"]],
         "note": "短查询（主题词只有几个字），语义信息稀薄",
     },
     {
         "id": "B02", "layer": "边界", "tag": "正文",
         "question": "2024年我国氯化钾的产量和进口量分别是多少？",
-        "expect": [{"type": "text", "kw": "620.5"}],
+        "expect": [{"chunk_type": "text", "kw": "620.5"}],
         "assert_groups": [["620.5"], ["1263"]],
         "note": "跨块聚合：答案分散在两个 chunk（产量 620.5 / 进口 1263 万吨），"
                "Top-3 只命中一块时生成层就会缺数——检索命中 ≠ 答案全对",
@@ -174,15 +183,15 @@ CASES = [
     {
         "id": "B03", "layer": "边界", "tag": "图片",
         "question": "2024年锂价整体走势如何？",
-        "expect": [{"type": "image", "page": 9}, {"type": "text", "kw": "锂价"}],
+        "expect": [{"chunk_type": "image", "page": 9}, {"chunk_type": "text", "kw": "锂价"}],
         "assert_groups": [["下行", "下跌", "下降", "回落", "波动", "走低", "承压"]],
         "note": "定性题：答案无精确数值，断言只能放宽到趋势词",
     },
     {
         "id": "B04", "layer": "边界", "tag": "表格+正文",
         "question": "盐湖股份2024年的董事长是谁？",
-        "expect": [[{"type": "table", "kw": "侯昭飞", "source": "盐湖股份2024年报（精选页）"},
-                    {"type": "table", "kw": "侯昭飞", "source": "盐湖股份2025年报（精选页）"}]],
+        "expect": [[{"chunk_type": "table", "kw": "侯昭飞", "source": "盐湖股份2024年报（精选页）"},
+                    {"chunk_type": "table", "kw": "侯昭飞", "source": "盐湖股份2025年报（精选页）"}]],
         "assert_groups": [["侯昭飞"]],
         "note": "措辞转换：语料里没有「董事长」，只有「法定代表人：侯昭飞」（p3 表格）"
                "——考检索的同义锚定 + 模型把法定代表人接到董事长上的接地推理。"
@@ -192,7 +201,7 @@ CASES = [
     {
         "id": "B05", "layer": "边界", "tag": "正文",
         "question": "盐湖股份2024年度的分红方案是什么？",
-        "expect": [{"type": "text", "kw": "派发现金红利"}],
+        "expect": [{"chunk_type": "text", "kw": "派发现金红利"}],
         "assert_groups": [["不派发现金红利"], ["2024"]],
         "note": "答案埋在行政文本：重要提示里写着「计划不派发现金红利、不送红股」，"
                "但该块对「分红」查询的语义距离远，检索捞不到 → 模型假拒答。"
@@ -207,7 +216,7 @@ CASES = [
             {"role": "user", "content": "盐湖股份2024年归母净利润是多少？"},
             {"role": "assistant", "content": "根据参考资料，盐湖股份2024年归属于上市公司股东的净利润为4,663,116,528.38元，约46.63亿元。"},
         ],
-        "expect": [{"type": "table", "page": 4, "source": "盐湖股份2025年报（精选页）"}],
+        "expect": [{"chunk_type": "table", "page": 4, "source": "盐湖股份2025年报（精选页）"}],
         "assert_groups": [["8,475,535,262", "84.76"]],
         "note": "多轮指代题（pre A/B 信号弹）：裸检索「那2025年呢」无实体词必挂；"
                "rewrite 带 history 消解成「盐湖股份2025年归母净利润」后应命中"
@@ -218,9 +227,9 @@ CASES = [
         "id": "M01", "layer": "综合", "tag": "表格",
         "question": "盐湖股份和云天化2024年的营业收入分别是多少？",
         "expect": [
-            [{"type": "table", "page": 4, "source": "盐湖股份2024年报（精选页）"},
-             {"type": "table", "page": 4, "source": "盐湖股份2025年报（精选页）"}],
-            [{"type": "table", "page": 4, "source": "云天化2024年报（精选页）"}],
+            [{"chunk_type": "table", "page": 4, "source": "盐湖股份2024年报（精选页）"},
+             {"chunk_type": "table", "page": 4, "source": "盐湖股份2025年报（精选页）"}],
+            [{"chunk_type": "table", "page": 4, "source": "云天化2024年报（精选页）"}],
         ],
         "assert_groups": [["15,134,119,500", "151.34"], ["61,536,936,910", "615.37"]],
         "note": "B 类跨文档：两个公司的会计数据表都要进 context 才答得全；"
@@ -230,9 +239,9 @@ CASES = [
         "id": "M02", "layer": "综合", "tag": "表格",
         "question": "盐湖股份2024年归母净利润比云天化低多少？",
         "expect": [
-            [{"type": "table", "page": 4, "source": "盐湖股份2024年报（精选页）"},
-             {"type": "table", "page": 4, "source": "盐湖股份2025年报（精选页）"}],
-            [{"type": "table", "page": 4, "source": "云天化2024年报（精选页）"}],
+            [{"chunk_type": "table", "page": 4, "source": "盐湖股份2024年报（精选页）"},
+             {"chunk_type": "table", "page": 4, "source": "盐湖股份2025年报（精选页）"}],
+            [{"chunk_type": "table", "page": 4, "source": "云天化2024年报（精选页）"}],
         ],
         "assert_groups": [["4,663,116,528", "46.63"], ["5,332,959,048", "53.33"],
                           ["6.7", "12.6"]],

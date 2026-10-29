@@ -86,8 +86,9 @@ def build_reply(answer: str, retrieved: list[dict]) -> str:
     if retrieved:
         parts.append("\n\n---\n**本次依据**")
         for i, e in enumerate(retrieved, 1):
-            where = f" {e['source']} p{e['page']}" if e["page"] else f" {e['source']}"
-            parts.append(f"\n[{i}]（{llm._TYPE_LABEL.get(e['type'], '正文')}）{where}")
+            sec = f"｜{e.section}" if e.section else ""
+            where = f" {e.source}{sec} p{e.page}" if e.page else f" {e.source}{sec}"
+            parts.append(f"\n[{i}]（{llm._TYPE_LABEL.get(e.chunk_type, '正文')}）{where}")
     return "".join(parts)
 
 
@@ -197,8 +198,9 @@ class RAGBotHandler(dingtalk_stream.ChatbotHandler):
         limits.count_tokens(tokens)
         trace.record(rid, "e2e", (time.perf_counter() - t0) * 1000, meta={"via": "dingtalk"})
 
-        sources = json.dumps([{"i": i, "type": e["type"], "source": e["source"], "page": e["page"]}
-                              for i, e in enumerate(retrieved, 1)], ensure_ascii=False)
+        sources = json.dumps([{"i": i, "chunk_type": e.chunk_type, "source": e.source,
+                               "page": e.page} for i, e in enumerate(retrieved, 1)],
+                             ensure_ascii=False)
         append_history(conv, "user", question)           # 入史的是原始问题（同 Web 端口径）
         append_history(conv, "assistant", answer, sources=sources,
                        latency_ms=latency_ms, tokens=tokens)

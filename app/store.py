@@ -7,7 +7,9 @@ Milvus Lite 单文件库（data/mini_rag.db）：一张 collection 装下「原�
 
 import hashlib
 import io
+import os
 import re
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import fitz  # PyMuPDF：PDF 解析（文本块/表格/图片）
@@ -22,10 +24,44 @@ from .llm import describe_image
 DATA_DIR = Path(__file__).parent.parent / "data"      # 向量库 + 图片原件 + 各种 sqlite
 MEDIA_DIR = DATA_DIR / "media"                        # 图片原件（chunk 只存文件名，前端经 /api/media/ 回显）
 
+
+@dataclass
+class Chunk:
+    """统一 chunk 数据模型：入库 / 检索 / 展示全链共用这一个定义（vector 由
+    insert_rows 补齐，不在模型里）。之前 store 层叫 chunk_type、pipeline 转手
+    改名 type、三个消费方各摸各的键——双名靠约定不散架，2026-10-30 收口。"""
+
+    text: str            # 可检索文本：embedding 与 BM25 的输入
+    chunk_type: str      # text | table | image
+    content: str         # 命中时回填 LLM 的原文（表格=HTML；正文与 text 同）
+    page: int            # PDF 页码；非 PDF / 跨页正文 = 0
+    section: str = ""    # 章节名（standalone 表格/图片块用；正文跨章节不硬造）
+    source: str = ""     # 来源文件名 stem（幂等键 + 展示 + 归因锚；insert_rows 统一补）
+
 RECALL_K = 20     # 粗排宽进捞多少
 TOP_K = 5         # 精排收紧留几条（进生成 context 的条数；10-29 多文档后 3→5：
                   # 评测两轮 命中@5 58.8% vs @3 47.1%，检索稳定 +11.7pp）
 RRF_K = 60        # RRFRanker 的 k
+
+# 章节锚（10-30 A/B 拍板）：独立表格块 text 加「source｜章节」前缀——22 条 × 3 轮
+# 两臂对比：命中@3/@5、答对、拒绝全部持平（75/80/80/100 vs 75/80/80/100），
+# Top-1 -5pp 在两臂重建库的 VLM 方差带内=中性 → 前缀默认不加（source 锚已吃掉
+# 表格题检索增益）。section 保留为元数据（bot/web 脚注展示「哪份文档哪一节」）。
+# RAGBOT_SECTION_ANCHOR=1 供语料变化后复验。
+SECTION_ANCHOR = os.environ.get("RAGBOT_SECTION_ANCHOR", "0") == "1"
+
+# 年报/公文风格章节标题：中文序号（一、/（一））或数字序号（1. / 2.1、），行短。
+# 误报形态（重要提示里的「一、二、」列举项）会把 section 名带偏——启发式接受，
+# 章节名只是检索辅助锚，不作结构承诺。
+_SECTION_RE = re.compile(
+    r"^(?:[（(]?[一二三四五六七八九十百]{1,4}[）)]?、?|\d+(?:\.\d+)*[、.．])\s*\S{1,28}$")
+
+
+def _anchor(text: str, source: str, section: str) -> str:
+    """独立表格块的可检索文本前缀：source 锚（必有）+ 章节锚（有则带上）。"""
+    if SECTION_ANCHOR and section:
+        return f"{source}｜{section}：{text}"
+    return f"{source}：{text}"
 
 
 class RecursiveTextSplitter:
@@ -88,8 +124,8 @@ class MilvusStore:
         旧版（纯文本）schema 缺多模态字段 → drop 重建（重传语料即可）。"""
         if self.client.has_collection(self.COLLECTION):
             fields = {f["name"] for f in self.client.describe_collection(self.COLLECTION)["fields"]}
-            if "chunk_type" not in fields:
-                self.client.drop_collection(self.COLLECTION)
+            if "chunk_type" not in fields or "section" not in fields:
+                self.client.drop_collection(self.COLLECTION)   # 旧 schema（缺多模态/章节字段）→ 重灌
             else:
                 self.client.load_collection(self.COLLECTION)
                 return
@@ -110,6 +146,7 @@ class MilvusStore:
         schema.add_field("chunk_type", DataType.VARCHAR, max_length=8)   # text | table | image
         schema.add_field("content", DataType.VARCHAR, max_length=65535)  # 命中时回填给 LLM 的原文（表格=HTML）
         schema.add_field("page", DataType.INT64)                          # PDF 页码（非 PDF 语料 = 0）
+        schema.add_field("section", DataType.VARCHAR, max_length=128)     # 章节名（standalone 块；正文跨章节为空）
 
         index = self.client.prepare_index_params()
         index.add_index(field_name="vector", index_type="HNSW", metric_type="COSINE",
@@ -119,12 +156,11 @@ class MilvusStore:
         self.client.create_collection(self.COLLECTION, schema=schema, index_params=index)
         self.client.load_collection(self.COLLECTION)
 
-    def insert_rows(self, rows: list[dict], vectors: list[list[float]], source: str):
-        """入库即持久化（库内 WAL 落盘）。rows 每项含 text/chunk_type/content/page，
-        source 统一在这里补进每一行（幂等键 + 展示）。"""
+    def insert_rows(self, chunks: list[Chunk], vectors: list[list[float]], source: str):
+        """入库即持久化（库内 WAL 落盘）。source 统一在这里补进每一行（幂等键 + 展示）。"""
         self.client.insert(self.COLLECTION,
-                           [{**r, "source": source, "vector": v}
-                            for r, v in zip(rows, vectors)])
+                           [{**asdict(c), "source": source, "vector": v}
+                            for c, v in zip(chunks, vectors)])
 
     def has_source(self, source: str) -> bool:
         """幂等判断：该来源是否已在库（标量过滤查询）。"""
@@ -142,7 +178,8 @@ class MilvusStore:
             param={"metric_type": "BM25"}, limit=top_k)
         hits = self.client.hybrid_search(
             self.COLLECTION, [dense, sparse], ranker=RRFRanker(RRF_K),
-            limit=top_k, output_fields=["text", "source", "chunk_type", "content", "page"])
+            limit=top_k,
+            output_fields=["text", "source", "chunk_type", "content", "page", "section"])
         return hits[0]
 
     def chunk_count(self) -> int:
@@ -254,11 +291,13 @@ def parse_pdf(data: bytes, source: str, vlm_key: str, splitter: RecursiveTextSpl
     MEDIA_DIR.mkdir(parents=True, exist_ok=True)
     stream, tables_html, standalone = [], {}, []
     seen_md5, vlm_ok = set(), 0
-    tid = 0
+    section, tid = "", 0
     for pno, page in enumerate(doc, 1):
         page_parts = []
         for el in _page_elements(page):
             if el["kind"] == "text":
+                if len(el["text"]) <= 30 and _SECTION_RE.match(el["text"]):
+                    section = el["text"]           # 章节标题块：更新当前章节（照常入正文流）
                 page_parts.append(el["text"])
             elif el["kind"] == "table":
                 html, text = _table_parts(el["table"])
@@ -268,10 +307,11 @@ def parse_pdf(data: bytes, source: str, vlm_key: str, splitter: RecursiveTextSpl
                     tables_html[str(tid)] = html
                 else:                               # 大表格：正文留引导句，HTML 独立成块
                     page_parts.append(f"〔大表格：{text.splitlines()[0]}，共{n_rows}行，独立成块〕")
-                    # text 版带 source 前缀：独立表格块脱离了正文上下文，没公司名锚
+                    # text 版带锚前缀：独立表格块脱离了正文上下文，没公司名/章节锚
                     # BM25/dense 两路都吃不到（10-29 M05 实证：星澜表格块被年报表挤出 Top-5）
-                    standalone.append({"text": f"{source}：{text}", "chunk_type": "table",
-                                       "content": html, "page": pno})
+                    standalone.append(Chunk(text=_anchor(text, source, section),
+                                            chunk_type="table", content=html,
+                                            page=pno, section=section))
                 tid += 1
             else:                                   # 图片：VLM 描述独立成块，正文留引导句
                 info = doc.extract_image(el["xref"])
@@ -288,19 +328,19 @@ def parse_pdf(data: bytes, source: str, vlm_key: str, splitter: RecursiveTextSpl
                 else:
                     desc = "（图片，VLM 描述生成失败）"
                 page_parts.append(f"〔图：{desc[:40]}…〕")
-                standalone.append({"text": f"图片描述：{desc}", "chunk_type": "image",
-                                   # 标记行不定界（无括号包裹）：文件名可含全角括号等字符，
-                                   # 按行尾提取永不截断——用成对括号当定界符会被文件名里的括号截断
-                                   "content": f"{desc}\n原图文件：{fname}", "page": pno})
+                standalone.append(Chunk(text=f"图片描述：{desc}", chunk_type="image",
+                                        # 标记行不定界（无括号包裹）：文件名可含全角括号等字符，
+                                        # 按行尾提取永不截断——用成对括号当定界符会被文件名里的括号截断
+                                        content=f"{desc}\n原图文件：{fname}", page=pno))
         if page_parts:
             stream.append("\n\n".join(page_parts))
     # 正文流切块：text 版剥标记、content 版还原 HTML；正文 chunk 可能跨页，page 记 0（不标注）
     rows = standalone
     for chunk in splitter.split_text("\n\n".join(stream)):
-        rows.append({"text": _TABLE_MARK.sub("", chunk),
-                     "chunk_type": "text",
-                     "content": _refill_tables(chunk, tables_html),
-                     "page": 0})
+        rows.append(Chunk(text=_TABLE_MARK.sub("", chunk),
+                          chunk_type="text",
+                          content=_refill_tables(chunk, tables_html),
+                          page=0))
     return rows, vlm_ok
 
 
@@ -340,7 +380,7 @@ def parse_docx(data: bytes, source: str, vlm_key: str, splitter: RecursiveTextSp
     doc = Document(io.BytesIO(data))
     MEDIA_DIR.mkdir(parents=True, exist_ok=True)
     parts, tables_html, standalone = [], {}, []
-    seen_md5, vlm_ok, tid, img_n = set(), 0, 0, 0
+    seen_md5, vlm_ok, tid, img_n, section = set(), 0, 0, 0, ""
     for block in _iter_block_items(doc):
         for img_bytes, ext in _docx_images(block):
             md5 = hashlib.md5(img_bytes).hexdigest()
@@ -357,9 +397,9 @@ def parse_docx(data: bytes, source: str, vlm_key: str, splitter: RecursiveTextSp
             else:
                 desc = "（图片，VLM 描述生成失败）"
             parts.append(f"〔图：{desc[:40]}…〕")
-            standalone.append({"text": f"图片描述：{desc}", "chunk_type": "image",
-                               # 标记行不定界：与 PDF 侧同口径（main.py 按行尾提取文件名）
-                               "content": f"{desc}\n原图文件：{fname}", "page": 0})
+            standalone.append(Chunk(text=f"图片描述：{desc}", chunk_type="image",
+                                    # 标记行不定界：与 PDF 侧同口径（main.py 按行尾提取文件名）
+                                    content=f"{desc}\n原图文件：{fname}", page=0))
         if isinstance(block, Table):
             grid = [[c.text.strip() for c in r.cells] for r in block.rows]
             if not grid:                           # 空表（python-docx 偶见占位表）
@@ -371,15 +411,24 @@ def parse_docx(data: bytes, source: str, vlm_key: str, splitter: RecursiveTextSp
                 tables_html[str(tid)] = html
             else:                                  # 大表格：正文留引导句，HTML 独立成块
                 parts.append(f"〔大表格：{text.splitlines()[0]}，共{n_rows}行，独立成块〕")
-                standalone.append({"text": f"{source}：{text}", "chunk_type": "table",
-                                   "content": html, "page": 0})
+                standalone.append(Chunk(text=_anchor(text, source, section),
+                                        chunk_type="table", content=html,
+                                        page=0, section=section))
             tid += 1
         elif isinstance(block, Paragraph) and block.text.strip():
-            parts.append(block.text.strip())
+            txt = block.text.strip()
+            # 章节标题两路识别：Heading 样式优先（规范文档）；兜底=加粗+序号正则
+            # （真实世界 docx 常用加粗大字号伪装标题——万华反样式样本专验这条路）
+            style = block.style.name if block.style is not None else ""
+            if style.startswith("Heading") or style.startswith("标题") or (
+                    len(txt) <= 30 and _SECTION_RE.match(txt)
+                    and any(r.bold for r in block.runs if r.text.strip())):
+                section = txt
+            parts.append(txt)
     rows = standalone
     for chunk in splitter.split_text("\n\n".join(parts)):
-        rows.append({"text": _TABLE_MARK.sub("", chunk),
-                     "chunk_type": "text",
-                     "content": _refill_tables(chunk, tables_html),
-                     "page": 0})
+        rows.append(Chunk(text=_TABLE_MARK.sub("", chunk),
+                          chunk_type="text",
+                          content=_refill_tables(chunk, tables_html),
+                          page=0))
     return rows, vlm_ok

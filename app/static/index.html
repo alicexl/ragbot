@@ -149,7 +149,8 @@ function renderSources(sources, reranked) {
   for (const s of sources) {
     const score = (s.score === null || s.score === undefined) ? "-" : s.score;
     const page = s.page ? ` p${s.page}` : "";
-    box.textContent += `\n[${s.i}]（${TYPE_TAG[s.type] || "正文"}）rrf=${s.rrf} score=${score} · ${s.source}${page}\n    ${s.preview}…`;
+    const sec = s.section ? `｜${s.section}` : "";
+    box.textContent += `\n[${s.i}]（${TYPE_TAG[s.chunk_type] || "正文"}）rrf=${s.rrf} score=${score} · ${s.source}${sec}${page}\n    ${s.preview}…`;
     if (s.image) images.push(s.image);   // 图片 chunk：下面回显原图
   }
   // 命中图片时展示原件：src 是服务端受控文件名（非用户文本），img 元素直接建、不走 innerHTML

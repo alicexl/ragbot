@@ -11,10 +11,20 @@ web 路由、钉钉 bot、评测脚本三个调用方共享同一套——Milvus
 
 import os
 import time
+from dataclasses import dataclass
 
 from . import llm, trace
-from .store import (DATA_DIR, MEDIA_DIR, RECALL_K, TOP_K, MilvusStore,
+from .store import (DATA_DIR, MEDIA_DIR, RECALL_K, TOP_K, Chunk, MilvusStore,
                     RecursiveTextSplitter, parse_docx, parse_pdf)
+
+
+@dataclass
+class RetrievedChunk(Chunk):
+    """检索命中：统一 chunk 模型 + 检索层元数据（rrf=融合分展示用；score=rerank 分，
+    rerank 退役后恒 None）。web / bot / eval 三个消费方共用。"""
+
+    rrf: float = 0.0
+    score: float | None = None
 
 # Pre-retrieval 模式（互斥，一次只有一个生效）：off=原样 embed（基线）/ rewrite=LLM
 # 改写问题（带 history 消解指代）/ hyde=假设文档只换 dense 向量（BM25 留原问——
@@ -50,11 +60,13 @@ def init(db_path: str | None = None):
     store = MilvusStore(db_path or str(DATA_DIR / "mini_rag.db"))
 
 
-def _to_entries(hits: list[dict], order: list[int], scores: dict[int, float]) -> list[dict]:
-    """Milvus 命中 + 精排顺序 → 统一 entry 字典（chat 路由与 build_context 共用）。"""
-    return [{"text": h["entity"]["text"], "content": h["entity"]["content"],
-             "type": h["entity"]["chunk_type"], "page": h["entity"]["page"],
-             "source": h["entity"]["source"], "rrf": h["distance"], "score": scores.get(i)}
+def _to_entries(hits: list[dict], order: list[int], scores: dict[int, float]) -> list[RetrievedChunk]:
+    """Milvus 命中 + 精排顺序 → RetrievedChunk（chat 路由与 build_context 共用）。"""
+    return [RetrievedChunk(text=h["entity"]["text"], content=h["entity"]["content"],
+                           chunk_type=h["entity"]["chunk_type"], page=h["entity"]["page"],
+                           section=h["entity"].get("section", ""),
+                           source=h["entity"]["source"],
+                           rrf=h["distance"], score=scores.get(i))
             for i in order for h in [hits[i]]]
 
 
@@ -133,12 +145,12 @@ def retrieve(question: str, top_k: int = TOP_K, rid: str | None = None,
     return entries, reranked
 
 
-def build_context(retrieved: list[dict]) -> str:
+def build_context(retrieved: list[RetrievedChunk]) -> str:
     """把精排后的 Top-K 拼成带编号 + 类型 + 来源标注的 context（回填 content 原文：
     表格=HTML、图片=描述）。来源标注让模型在多文档下按公司/年份正确归因——
     10-29 实测：无来源标注时模型把盐湖的数字安到云天化头上（M01/M03 探针）。"""
-    parts = [f"[{i}][{llm._TYPE_LABEL.get(e['type'], '正文')}｜来源：{e['source']}] "
-             f"{e['content'] or e['text']}" for i, e in enumerate(retrieved, 1)]
+    parts = [f"[{i}][{llm._TYPE_LABEL.get(e.chunk_type, '正文')}｜来源：{e.source}] "
+             f"{e.content or e.text}" for i, e in enumerate(retrieved, 1)]
     return "\n\n".join(parts)
 
 
@@ -155,27 +167,27 @@ def ingest_text(text: str, source: str) -> tuple[int, bool, str]:
         return 0, False, f"[SKIP]「{source}」已在库中"
     rid = trace.new_request_id()
     t0 = time.perf_counter()
-    chunks = splitter.split_text(text)
-    rows = [{"text": c, "chunk_type": "text", "content": c, "page": 0} for c in chunks]
-    store.insert_rows(rows, embedder.embed_batch(chunks), source)
+    texts = splitter.split_text(text)
+    chunks = [Chunk(text=c, chunk_type="text", content=c, page=0) for c in texts]
+    store.insert_rows(chunks, embedder.embed_batch(texts), source)
     trace.record(rid, "ingest", (time.perf_counter() - t0) * 1000,
-                 meta={"source": source, "chunks": len(chunks)})
-    return len(chunks), True, f"[OK]「{source}」+{len(chunks)} 块"
+                 meta={"source": source, "chunks": len(texts)})
+    return len(texts), True, f"[OK]「{source}」+{len(texts)} 块"
 
 
-def _ingest_rows(source: str, rows: list[dict], vlm_ok: int) -> tuple[int, bool, str]:
-    """多模态 chunk 行入库 + ingest span + 结果摘要（ingest_pdf / ingest_docx 共用尾巴）。"""
+def _ingest_rows(source: str, chunks: list[Chunk], vlm_ok: int) -> tuple[int, bool, str]:
+    """多模态 chunk 入库 + ingest span + 结果摘要（ingest_pdf / ingest_docx 共用尾巴）。"""
     rid = trace.new_request_id()
     t0 = time.perf_counter()
-    store.insert_rows(rows, embedder.embed_batch([r["text"] for r in rows]), source)
-    by_type = {t: sum(1 for r in rows if r["chunk_type"] == t) for t in ("text", "table", "image")}
+    store.insert_rows(chunks, embedder.embed_batch([c.text for c in chunks]), source)
+    by_type = {t: sum(1 for c in chunks if c.chunk_type == t) for t in ("text", "table", "image")}
     imgs = by_type["image"]
     vlm_note = f"，VLM 描述 {vlm_ok}/{imgs}" if imgs else ""
     labels = {"text": "文本", "table": "表格", "image": "图片"}
     types = " + ".join(f"{v}{labels[k]}" for k, v in by_type.items() if v)
     trace.record(rid, "ingest", (time.perf_counter() - t0) * 1000,
-                 meta={"source": source, "chunks": len(rows), "vlm_ok": vlm_ok})
-    return len(rows), True, f"[OK]「{source}」+{len(rows)} 块（{types}{vlm_note}）"
+                 meta={"source": source, "chunks": len(chunks), "vlm_ok": vlm_ok})
+    return len(chunks), True, f"[OK]「{source}」+{len(chunks)} 块（{types}{vlm_note}）"
 
 
 def ingest_pdf(data: bytes, source: str) -> tuple[int, bool, str]:

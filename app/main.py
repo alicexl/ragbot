@@ -104,12 +104,13 @@ def chat():
     llm_messages = pipeline.build_user_msg(message, retrieved, history)        # 增强：拼 context
     sources_payload = []
     for i, e in enumerate(retrieved, 1):
-        m = re.search(r"原图文件：(.+)$", e["content"], re.M) if e["type"] == "image" else None
+        m = re.search(r"原图文件：(.+)$", e.content, re.M) if e.chunk_type == "image" else None
         sources_payload.append({
-            "i": i, "rrf": round(e["rrf"], 4),
-            "score": (round(e["score"], 3) if e["score"] is not None else None),
-            "type": e["type"], "page": e["page"], "source": e["source"],
-            "preview": e["text"].replace("\n", " ").strip()[:80],
+            "i": i, "rrf": round(e.rrf, 4),
+            "score": (round(e.score, 3) if e.score is not None else None),
+            "chunk_type": e.chunk_type, "page": e.page, "source": e.source,
+            "section": e.section or None,
+            "preview": e.text.replace("\n", " ").strip()[:80],
             "image": m.group(1) if m else None,      # 图片 chunk → 文件名，前端回显原图
         })
 
