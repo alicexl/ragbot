@@ -6,11 +6,15 @@ Milvus Lite 单文件库（data/mini_rag.db）：一张 collection 装下「原�
 """
 
 import hashlib
+import io
 import re
 from pathlib import Path
 
 import fitz  # PyMuPDF：PDF 解析（文本块/表格/图片）
 import pandas as pd
+from docx import Document  # python-docx：Word 解析（段落/表格/内嵌图片）
+from docx.table import Table
+from docx.text.paragraph import Paragraph
 from pymilvus import AnnSearchRequest, DataType, Function, FunctionType, MilvusClient, RRFRanker
 
 from .llm import describe_image
@@ -214,13 +218,19 @@ def _page_elements(page) -> list[dict]:
 
 
 def _table_parts(tab) -> tuple[str, str]:
-    """表格 → (html, text)：HTML 保行列结构（LLM 读表格远好于线性化文本），
-    text 是文本化版（表头一行 + 逐行竖线拼接），给 embedding 和 BM25 用。"""
+    """PDF 表格 → (html, text)：PyMuPDF 表格先转 DataFrame（多级表头拉平、
+    Col0/Col1 占位清空），再走与 docx 表格共用的 _df_parts。"""
     df = tab.to_pandas().fillna("")
     if isinstance(df.columns, pd.MultiIndex):       # 多级表头拉平成一行
         df.columns = [" ".join(map(str, c)) for c in df.columns]
     df.rename(columns=lambda c: "" if re.fullmatch(r"Col\d+", str(c)) else c,
               inplace=True)                         # PyMuPDF 没认出的表头占位（Col0/Col1…）清成空
+    return _df_parts(df)
+
+
+def _df_parts(df: pd.DataFrame) -> tuple[str, str]:
+    """DataFrame → (html, text)：HTML 保行列结构（LLM 读表格远好于线性化文本），
+    text 是文本化版（表头一行 + 逐行竖线拼接），给 embedding 和 BM25 用。"""
     html = df.to_html(index=False)
     lines = ["表头：" + "、".join(str(c) for c in df.columns)]
     lines += ["｜".join(str(v) for v in row) for row in df.itertuples(index=False)]
@@ -258,7 +268,9 @@ def parse_pdf(data: bytes, source: str, vlm_key: str, splitter: RecursiveTextSpl
                     tables_html[str(tid)] = html
                 else:                               # 大表格：正文留引导句，HTML 独立成块
                     page_parts.append(f"〔大表格：{text.splitlines()[0]}，共{n_rows}行，独立成块〕")
-                    standalone.append({"text": text, "chunk_type": "table",
+                    # text 版带 source 前缀：独立表格块脱离了正文上下文，没公司名锚
+                    # BM25/dense 两路都吃不到（10-29 M05 实证：星澜表格块被年报表挤出 Top-5）
+                    standalone.append({"text": f"{source}：{text}", "chunk_type": "table",
                                        "content": html, "page": pno})
                 tid += 1
             else:                                   # 图片：VLM 描述独立成块，正文留引导句
@@ -285,6 +297,87 @@ def parse_pdf(data: bytes, source: str, vlm_key: str, splitter: RecursiveTextSpl
     # 正文流切块：text 版剥标记、content 版还原 HTML；正文 chunk 可能跨页，page 记 0（不标注）
     rows = standalone
     for chunk in splitter.split_text("\n\n".join(stream)):
+        rows.append({"text": _TABLE_MARK.sub("", chunk),
+                     "chunk_type": "text",
+                     "content": _refill_tables(chunk, tables_html),
+                     "page": 0})
+    return rows, vlm_ok
+
+
+# ================================================================
+# Word（.docx）解析管线：与 PDF 管线同构的三类 chunk
+#   python-docx 的 paragraphs / tables 是两个平铺列表，阅读顺序只在 body 元素流里
+#   ——按 body 迭代保持段/表交错序。表格共用 _df_parts（小表内联〔表格Tn〕边界
+#   标记、大表独立成块）；内嵌图片 md5 去重后落 media/ + VLM 描述。
+#   旧版 .doc（OLE2 二进制）python-docx 不吃——上传处明确引导转存 .docx。
+# ================================================================
+_NS_A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"       # a:blip
+_NS_R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"  # r:embed
+
+
+def _iter_block_items(doc):
+    """按文档顺序产出 Paragraph / Table（python-docx 官方 recipe 的最简版）。"""
+    for child in doc.element.body.iterchildren():
+        if child.tag.endswith("}p"):
+            yield Paragraph(child, doc)
+        elif child.tag.endswith("}tbl"):
+            yield Table(child, doc)
+
+
+def _docx_images(block) -> list[tuple[bytes, str]]:
+    """块内内嵌图片 [(bytes, ext)…]——a:blip 的 r:embed 指到包内图片 part。"""
+    out = []
+    for blip in block._element.findall(f".//{_NS_A}blip"):
+        part = block.part.related_parts.get(blip.get(f"{_NS_R}embed"))
+        if part is not None and getattr(part, "blob", None):
+            out.append((part.blob, part.partname.ext.lstrip(".") or "png"))
+    return out
+
+
+def parse_docx(data: bytes, source: str, vlm_key: str, splitter: RecursiveTextSplitter):
+    """Word 文档字节 → 多模态 chunk 行，与 parse_pdf 同构（正文流/表格/图片三类）。
+    docx 无页码：page 一律 0。返回 (rows, vlm_ok)。"""
+    doc = Document(io.BytesIO(data))
+    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+    parts, tables_html, standalone = [], {}, []
+    seen_md5, vlm_ok, tid, img_n = set(), 0, 0, 0
+    for block in _iter_block_items(doc):
+        for img_bytes, ext in _docx_images(block):
+            md5 = hashlib.md5(img_bytes).hexdigest()
+            if md5 in seen_md5:                    # 同图多处引用只入一次
+                continue
+            seen_md5.add(md5)
+            img_n += 1
+            fname = f"{source}_img{img_n}.{ext}"
+            (MEDIA_DIR / fname).write_bytes(img_bytes)
+            mime = f"image/{'jpeg' if ext in ('jpg', 'jpeg') else ext}"
+            desc = describe_image(vlm_key, img_bytes, mime)
+            if desc:
+                vlm_ok += 1
+            else:
+                desc = "（图片，VLM 描述生成失败）"
+            parts.append(f"〔图：{desc[:40]}…〕")
+            standalone.append({"text": f"图片描述：{desc}", "chunk_type": "image",
+                               # 标记行不定界：与 PDF 侧同口径（main.py 按行尾提取文件名）
+                               "content": f"{desc}\n原图文件：{fname}", "page": 0})
+        if isinstance(block, Table):
+            grid = [[c.text.strip() for c in r.cells] for r in block.rows]
+            if not grid:                           # 空表（python-docx 偶见占位表）
+                continue
+            html, text = _df_parts(pd.DataFrame(grid[1:], columns=grid[0]))
+            n_rows = len(block.rows)
+            if n_rows <= SMALL_TABLE_ROWS:         # 小表格：边界标记内联，跟正文一起切
+                parts.append(f"〔表格T{tid}〕\n{text}\n〔/表格T{tid}〕")
+                tables_html[str(tid)] = html
+            else:                                  # 大表格：正文留引导句，HTML 独立成块
+                parts.append(f"〔大表格：{text.splitlines()[0]}，共{n_rows}行，独立成块〕")
+                standalone.append({"text": f"{source}：{text}", "chunk_type": "table",
+                                   "content": html, "page": 0})
+            tid += 1
+        elif isinstance(block, Paragraph) and block.text.strip():
+            parts.append(block.text.strip())
+    rows = standalone
+    for chunk in splitter.split_text("\n\n".join(parts)):
         rows.append({"text": _TABLE_MARK.sub("", chunk),
                      "chunk_type": "text",
                      "content": _refill_tables(chunk, tables_html),

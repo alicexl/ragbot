@@ -9,3 +9,5 @@ pymupdf
 pandas
 # 钉钉机器人（Stream 模式，出站连接免公网）
 dingtalk-stream
+# Word 文档解析：docx 段落/表格/图片（旧版 .doc 不支持，上传处引导转存）
+python-docx

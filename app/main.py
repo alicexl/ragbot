@@ -3,7 +3,7 @@
 路由（与数据流）：
   GET  /                聊天页（app/static/index.html）
   GET  /api/status      库状态（chunk 数 + 文档清单）
-  POST /api/upload      multipart 上传 → 切块/向量化/入库（幂等；PDF 走多模态解析）
+  POST /api/upload      multipart 上传 → 切块/向量化/入库（幂等；PDF/Word 走多模态解析）
   POST /api/clear       清空向量库
   POST /api/chat        SSE 流式回答（sources → delta… → done / error）
   GET  /api/media/<名>   图片 chunk 原图回显
@@ -51,8 +51,13 @@ def upload():
     notes = []
     for f in files:
         source = Path(f.filename).stem        # source 取文件名（去扩展名，幂等键）
-        if f.filename.lower().endswith(".pdf"):
+        name_l = f.filename.lower()
+        if name_l.endswith(".pdf"):
             notes.append(pipeline.ingest_pdf(f.read(), source)[2])
+        elif name_l.endswith(".docx"):
+            notes.append(pipeline.ingest_docx(f.read(), source)[2])
+        elif name_l.endswith(".doc"):
+            notes.append(f"[ERR]「{source}」旧版 .doc 不支持：请在 Word 里转存为 .docx 再上传")
         else:
             notes.append(pipeline.ingest_text(f.read().decode("utf-8", errors="replace"), source)[2])
     return jsonify(chunks=pipeline.store.chunk_count(), notes=notes)
@@ -94,7 +99,8 @@ def chat():
 
     rid = trace.new_request_id()
     t_e2e = time.perf_counter()
-    retrieved, reranked = pipeline.retrieve(message, top_k=TOP_K, rid=rid)     # 混合检索
+    retrieved, reranked = pipeline.retrieve(message, top_k=TOP_K, rid=rid,
+                                            history=history)                   # 混合检索
     llm_messages = pipeline.build_user_msg(message, retrieved, history)        # 增强：拼 context
     sources_payload = []
     for i, e in enumerate(retrieved, 1):

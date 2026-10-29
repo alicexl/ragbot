@@ -4,6 +4,8 @@
 命名与字段留了升级路（request_id / stage / status / ms / meta，接 OTel 就是换个 exporter）。
 
 stage 约定（压测与 README 按同一口径聚合）：
+  pre_rewrite/…    pre-retrieval（PRE_MODE：pre_rewrite/pre_hyde/pre_multi；
+                   status=degraded 表示 LLM 失败降级原问直检）
   embed            查询向量化
   search           Milvus 两路召回 + RRF 融合
   rerank           精排（status=degraded 表示失败降级回融合序）

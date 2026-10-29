@@ -7,13 +7,14 @@
 - 指标按环节拆开：检索（命中@3、Top-1）与生成（答对率、拒绝率、pass@N / pass^N）
   分开报——成功率上不去时，才分得清是检索没捞到还是生成没答好
 
-语料：评测用独立库 data/eval.db，自动导入 sample_reports/ 下全部 PDF + 干扰文档
+语料：评测用独立库 data/eval.db，自动导入 sample_reports/ 下全部 PDF/docx + 干扰文档
 （eval/distractor.txt，虚构公司年报——考检索/归因不被无关文档带偏）。独立库不碰
 生产库 mini_rag.db，锁按文件隔离，线上服务不用停；eval.db 可整库删除重建。
 
 启动（前提：智谱 Key 已设）:
     python -X utf8 -m eval.run_eval             # 每条生成 3 次
     python -X utf8 -m eval.run_eval --runs 5
+    python -X utf8 -m eval.run_eval --pre rewrite   # pre-retrieval A/B（off/rewrite/hyde/multi）
 """
 
 import argparse
@@ -77,13 +78,16 @@ def generate(question: str, history: list[dict], retrieved: list[dict]) -> tuple
 
 
 def _ensure_fixtures() -> str:
-    """评测库语料：sample_reports/ 下全部 PDF + distractor.txt（幂等，已入库自动跳过）。
+    """评测库语料：sample_reports/ 下全部 PDF/docx + distractor.txt（幂等，已入库自动跳过）。
     首次导入 PDF 会跑 VLM 描述图片，慢属正常；想加真干扰文档就往 sample_reports 丢 PDF。"""
     notes = []
     for name in sorted(os.listdir(SAMPLE_DIR)):          # 中文/特殊字符文件名，不用 glob
         if name.lower().endswith(".pdf"):
             notes.append(pipeline.ingest_pdf((SAMPLE_DIR / name).read_bytes(),
                                              Path(name).stem)[2])
+        elif name.lower().endswith(".docx"):
+            notes.append(pipeline.ingest_docx((SAMPLE_DIR / name).read_bytes(),
+                                              Path(name).stem)[2])
     notes.append(pipeline.ingest_text(DISTRACTOR.read_text(encoding="utf-8"),
                                       DISTRACTOR.stem)[2])
     return " · ".join(notes)
@@ -97,6 +101,8 @@ def main():
                     help="检索进生成 context 的条数（默认=生产常量 TOP_K；仅评测实验，不改生产）")
     ap.add_argument("--rerank", action="store_true",
                     help="打开 rerank 层（默认关闭——10-29 评测实证净负，留作换供应商后 A/B）")
+    ap.add_argument("--pre", choices=["off", "rewrite", "hyde", "multi"], default="off",
+                    help="pre-retrieval 模式（默认 off=基线；只影响本次评测，不改生产 PRE_MODE）")
     args = ap.parse_args()
 
     pipeline.init(db_path=EVAL_DB)
@@ -109,7 +115,7 @@ def main():
     print("=" * 68)
     print(f"ragbot 评测 · 独立库 {pipeline.store.chunk_count()} 块（含干扰文档）"
           f" · 评测集 {len(CASES)} 条（该做 {n_do} / 不该做 {n_refuse}）· 每条生成 {args.runs} 次"
-          f" · context Top-{args.top_k}")
+          f" · context Top-{args.top_k} · pre={args.pre}")
     print("=" * 68)
 
     rows = []
@@ -129,7 +135,9 @@ def main():
         for _ in range(args.runs):
             t0 = time.perf_counter()
             retrieved, reranked = pipeline.retrieve(case["question"], top_k=args.top_k,
-                                                    use_rerank=args.rerank)
+                                                    use_rerank=args.rerank,
+                                                    history=case.get("history"),
+                                                    pre=args.pre)
             ret_ms.append((time.perf_counter() - t0) * 1000)
             degraded += (not reranked)
 
@@ -149,7 +157,7 @@ def main():
                 top1_any = top1_any or top1
 
             t0 = time.perf_counter()
-            answer, tokens = generate(case["question"], [], retrieved)
+            answer, tokens = generate(case["question"], case.get("history") or [], retrieved)
             gen_s.append(time.perf_counter() - t0)
             tok += tokens
             ok = _score_answer(answer, case)

@@ -1,4 +1,4 @@
-"""模型 API 客户端层：embedding / rerank / 生成 / VLM 四类调用与 key 拓扑
+"""模型 API 客户端层：embedding / rerank / 生成 / VLM / pre-retrieval 五类调用与 key 拓扑
 
 key 拓扑（拆分背景：生成商可独立切换，检索侧固定智谱）：
 - ANTHROPIC_API_KEY → 智谱 Key：embedding-3 / rerank / VLM（glm-4v-flash）走智谱原生 API
@@ -126,6 +126,65 @@ def _describe_image_once(api_key: str, b64: str, mime: str) -> str:
     )
     resp.raise_for_status()
     return resp.json()["choices"][0]["message"]["content"].strip()
+
+
+# ================================================================
+# Pre-retrieval 层：查询改写 / HyDE / multi-query（互斥模式，见 pipeline.PRE_MODE）
+# 共用一次性小生成：deepseek-flash、关思考、5s 超时、不重试——
+# 失败由调用方（pipeline.retrieve）降级原问直检，rerank 同款哲学：降级就是容错
+# ================================================================
+
+_REWRITE_SYSTEM = (
+    "你是检索查询改写器。把用户的最后一问改写成一个独立、完整、检索友好的问题："
+    "① 消解指代（它/该公司/同年）——从对话上文补全公司名、年份、指标名；"
+    "② 口语改书面（「赚了多少钱」→「归母净利润是多少」）；"
+    "③ 保持原意，不得添加上文没有的新限定。只输出改写后的问题，不要任何解释。"
+)
+_HYDE_SYSTEM = (
+    "你为公司年报问答系统生成一段假设性答案段落（HyDE 检索用）：写这个问题"
+    "「可能出现在年报里」的直接回答，100 字以内；不要求真实，但术语、口径、"
+    "表述风格要贴近财报（如「归属于上市公司股东的净利润」）。只输出段落本身。"
+)
+_MULTI_SYSTEM = (
+    "把用户问题改写成 3 个用于检索的变体：① 同义改写（换措辞、同角度）；"
+    "② 术语化（口语词换成财报/行业标准术语）；③ 换角度（问题的另一面）。"
+    "每行一个，共 3 行，不要编号不要解释。"
+)
+
+
+def _pre_llm(system: str, user: str, max_tokens: int = 128) -> str:
+    """pre-retrieval 专用非流式小生成（输出短，流式没有意义）。"""
+    client = Anthropic(base_url=_CHAT_BASE_URL, api_key=_CHAT_API_KEY,
+                       timeout=httpx.Timeout(5.0, read=5.0))
+    resp = client.messages.create(model=_CHAT_MODEL, max_tokens=max_tokens,
+                                  system=system, thinking={"type": "disabled"},
+                                  messages=[{"role": "user", "content": user}])
+    return resp.content[0].text.strip()
+
+
+def rewrite_query(question: str, history: list[dict] | None = None) -> str:
+    """最后一问 → 独立完整问题（消解指代 + 口语术语化）。单轮无指代时模型
+    多半原样返回，无害——照常直检索。"""
+    lines = []
+    for m in (history or [])[-6:]:                # 与 bot HISTORY_WINDOW 同量级
+        who = "用户" if m["role"] == "user" else "助手"
+        lines.append(f"{who}：{m['content']}")
+    dialog = "\n".join(lines)
+    user = (f"对话上文：\n{dialog}\n\n最后一问：{question}\n\n改写后的独立问题："
+            if dialog else f"{question}\n\n改写后的问题：")
+    return _pre_llm(_REWRITE_SYSTEM, user)
+
+
+def hypothetical_doc(question: str) -> str:
+    """HyDE：生成假设性答案段落——用它做 embedding 检索（问题与答案文档的
+    向量空间有差距，假设答案直接落在答案一侧）。"""
+    return _pre_llm(_HYDE_SYSTEM, question, max_tokens=200)
+
+
+def multi_query(question: str, n: int = 3) -> list[str]:
+    """multi-query：n 个检索变体（调用方会拼上原问一起 fan-out）。"""
+    out = [ln.strip("-• \t") for ln in _pre_llm(_MULTI_SYSTEM, question, max_tokens=150).splitlines()]
+    return [ln for ln in out if ln][:n]
 
 
 # ================================================================

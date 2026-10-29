@@ -178,7 +178,8 @@ class RAGBotHandler(dingtalk_stream.ChatbotHandler):
         rid = trace.new_request_id()
         t0 = time.perf_counter()
         history = load_history(conv)
-        retrieved, reranked = pipeline.retrieve(question, top_k=TOP_K, rid=rid)
+        retrieved, reranked = pipeline.retrieve(question, top_k=TOP_K, rid=rid,
+                                                history=history)
 
         # AI 卡片先上（「执行中」占位）。注意 SDK 的坑：建卡失败是静默的（不抛异常、
         # card_instance_id 留空），必须显式校验，否则废卡会吞掉降级路径
