@@ -6,26 +6,159 @@
 
 ## 架构
 
+### 总览
+
 ```
                     ┌─ Web 客户端（app/static，SSE 流式 + 文档上传）
 请求 → Flask 路由 ──┤
                     └─ 钉钉机器人（app/bot.py，Stream 出站 WebSocket 免公网，
                        AI 卡片打字机，会话与使用日志服务端持有）
         │
-   pipeline（app/pipeline.py：三客户端共享同一条链）
-        ├─ ingest   PDF / docx 多模态解析（表格→HTML 保行列、图片→VLM 描述）→ 切块 → embedding → Milvus
-        ├─ retrieve pre-retrieval（PRE_MODE：off/rewrite/hyde/multi，A/B 拍板）→ embedding
-        │           → Milvus 两路召回 + RRF 融合 Top-5（rerank 层已退役，见演进记录）
-        ├─ generate 拼参考资料（类型+来源标注）→ 流式生成（首字超时重试一次 / 总时长兜底）
+   pipeline（app/pipeline.py：单例接线，web / bot / eval 三个调用方
+            共享同一条链——评测测的就是线上这条链）
+        ├─ ingest   PDF / docx 多模态解析 → Chunk → embedding → Milvus
+        ├─ retrieve pre-retrieval（PRE_MODE，默认 off）→ embedding
+        │           → Milvus 两路召回 + RRF 融合 → Top-5（rerank 已退役）
+        └─ generate 拼 context（编号+类型+来源标注）→ 流式生成
         │
    横切面：trace（request_id + span 落 SQLite）· limits（按人日限 + token 日预算）
 ```
 
-**模型拓扑**（key 拆分）：智谱 embedding-3 / rerank / glm-4v（检索侧固定）+ 生成固定 DeepSeek anthropic 兼容端点（deepseek-flash，实测快 4 倍且评测持平，见下）。
+### 代码地图
 
-## 关键指标（真实跑出来的，复现命令都在本仓）
+| 模块 | 职责 |
+|---|---|
+| `app/main.py` | Flask 入口：路由 + SSE 流式 + 钉钉线程接线 |
+| `app/bot.py` | 钉钉 Stream 机器人：会话历史 + 使用日志（一表两用）+ AI 卡片打字机 |
+| `app/pipeline.py` | 胶合层：单例接线（init）+ ingest / retrieve / generate 入口 + context 拼装 |
+| `app/store.py` | 存储与解析：Chunk 模型、Milvus Lite 封装、PDF/docx 多模态解析、递归切块器 |
+| `app/llm.py` | 模型客户端：embedder / rerank / VLM / 流式生成 / pre-retrieval，含重试与超时策略 |
+| `app/trace.py` | request_id 贯穿全链 + span 落 SQLite |
+| `app/limits.py` | 按人每日问数 + 全局 token 日预算 |
+| `eval/` | 评测集（evalset.py）+ 判分 runner（run_eval.py） |
+| `loadtest/` | 压测 |
 
-**质量评测**（`python -X utf8 -m eval.run_eval`，22 条四层评测集 × 3 次，判分全代码断言；评测用独立库 data/eval.db + 干扰文档，无需停服务）：
+### 入口层：Web + 钉钉，一条链两个壳
+
+Web 端点（`app/main.py`）：
+
+| 端点 | 作用 |
+|---|---|
+| `GET /` | 聊天页（app/static/index.html） |
+| `GET /api/status` | 库状态：chunk 数 + 已导入文档清单 |
+| `POST /api/upload` | multipart 上传：.pdf/.docx 走多模态管线，.doc 明确拒绝并引导转存，其余按纯文本；幂等（重复导入跳过） |
+| `POST /api/chat` | SSE 流式：先推 `sources`（命中清单：分数/类型/页码/章节/图片链接），再 `delta…` 逐字，末帧 `done` / `error` |
+| `POST /api/clear` | drop collection 重建（比删 .db 干净，避开文件锁） |
+| `GET /api/media/<名>` | 图片 chunk 原图回显（受控目录，无遍历风险） |
+
+钉钉机器人（`app/bot.py`，`DINGTALK_CLIENT_ID/SECRET` 两 env 设了即随服务起线程）：
+
+- **Stream 模式 = 出站 WebSocket**：本进程主动连钉钉服务器，零公网 IP / 域名 / 证书；未认证个人团队即可用（平台侧开 `Card.Instance.Write` + `Card.Streaming.Write` 两权限）
+- **会话状态服务端持有**（Web 端由前端上送，这里 SQLite 按 conversation_id，最近 6 条 = 3 轮）；user 行只存原始问题不带参考资料，防多轮滚雪球
+- **history 表同时是使用日志**（问题/答案/来源/延迟/token）——坏例排查与真实 query 积累从这里长出来
+- 回复链路：收到消息**先 ACK 再异步回答**（生成长尾会触发钉钉超时重推，message_id 去重）→ 先发 AI 卡片「执行中」占位 → 流式写入（打字机三要素：首帧置态 / 底层帧 / isFinalize 终帧）→ ai_finish 定稿
+- 与 Web 共库**同进程**（Milvus 单进程文件锁决定）
+
+### 数据模型：Chunk 一处定义，全链共用
+
+```python
+@dataclass Chunk:        # app/store.py —— 入库 / 检索 / 展示共用这一个定义
+    text: str            # 可检索文本：embedding 与 BM25 的输入
+    chunk_type: str      # text | table | image
+    content: str         # 命中时回填给 LLM 的原文（表格=HTML；正文与 text 同）
+    page: int            # PDF 页码；非 PDF / 跨页正文 = 0
+    section: str = ""    # 章节名（独立表格块用；正文跨章节不硬造）
+    source: str = ""     # 来源文件名 stem（幂等键 + 展示 + 归因锚）
+```
+
+- **text 与 content 分离**是三模态统一的关键：检索吃文本化版本，生成吃原文（表格 HTML 保行列结构，LLM 按单元格读数远好于线性化文本）
+- **独立表格块的 text 带 `source：` 锚前缀**——多模态块脱离正文流独立成块后没有公司名，不带锚则 BM25/dense 两路都吃不到（M05 实证：命中 57.9→84.2%，见演进记录）
+- 检索命中 = `RetrievedChunk(Chunk) + rrf/score`，web / bot / eval 三个消费方共用
+
+### 入库（ingest）：三模态进同一检索空间
+
+**PDF（PyMuPDF）**——每页抽三类元素（文本块 / 表格 / 图片）按 y 坐标排序还原「元素流」：
+
+- 页眉（y<80pt）/ 页脚剔除；表格区内的文本块剔除（表格整体转 HTML，不重复计字）；块内硬换行是排版折行，拼回连续文本
+- 章节标题（中文序号「一、/（一）」或数字序号「1. / 2.1」正则 + 行短）更新当前章节，记进独立块的 `section`
+- **小表格（≤10 行）**：以〔表格Tn〕边界标记跟正文一起切块（上下文不丢），content 版替换回 HTML
+- **大表格**：独立成 table 块（text 带 source 锚），正文留引导句
+- **图片**：装饰过滤（最短边<50pt / 面积>80% 页面 / 同位叠放 / 跨页同图 md5 去重）→ 原件落 `data/media/` → glm-4v-flash 生成描述（「图表类型+主体+趋势，不推测数字」），描述独立成块参与检索，命中时前端经 `/api/media/` 回显原图
+
+**docx（python-docx）**——与 PDF 同构的三类 chunk：按 body 元素流迭代保持段/表交错序（paragraphs/tables 两个平铺列表会丢阅读顺序）；章节识别两路 = Heading 样式优先 + **加粗+序号正则兜底**（真实世界 docx 常用加粗伪装标题，反样式样本专验这条路）；docx 无页码，page=0
+
+**纯文本**——直接切块。切块器 RecursiveTextSplitter：chunk_size=400 / overlap=50，分隔符优先级 段落→换行→句读→空格→字符级兜底。
+
+入库幂等：source 已在库（标量过滤查询）即跳过。
+
+### 存储与检索：Milvus Lite 库内混合检索
+
+- **单文件库**：生产 `data/mini_rag.db`、评测 `data/eval.db`。单进程文件锁——同一 data 目录同一时刻只允许一个进程打开；web/bot 共库同进程，评测独立库不碰生产、无需停服务
+- **一张 collection 装下一切**：`text`（VARCHAR 65535，jieba analyzer——中文按词切不按字切）→ 库内 **BM25 Function** 自动出 sparse 向量（不用手填）；`vector`（1024 维，HNSW/COSINE）；`source/chunk_type/content/page/section` 标量字段随行存
+- **检索一次 `hybrid_search` 库内完成**：dense 路（查询向量，COSINE）+ sparse 路（查询原文进来，库内 jieba 分词打 BM25）各捞 RECALL_K=20 → **RRFRanker(k=60) 融合** → 取 Top-K=5 进 context
+- rerank 层已退役（智谱分数饱和，见可靠性设计表）；pre-retrieval（rewrite/hyde/multi）默认 off（A/B 结论见评测）
+
+### 生成：接地 + 归因 + 流式
+
+- **context 拼装**：`[n][类型｜来源：source] + content` 逐条编号，模型引用「根据[1]」；来源标注让模型在多文档下按公司/年份正确归因（无标注时实测把盐湖数字安到云天化头上，答对 34.9→52.9%）
+- **SYSTEM_PROMPT 四条硬约束**：只据参考资料答 / 用到哪条标编号 / 按公司与年份归因 / 无信息则「资料中未提及」禁编造——评测的拒绝率与归因正确性就是对它的直接检验
+- **多轮**：history 原样拼在本轮之前，本轮问题才带参考资料
+- **StreamedAnswer**（Web SSE 与钉钉打字机共用同一段代码）：首字/流间隔 15s 超时 → 取消重试一次（长尾多为上游排队抖动，重试大概率落快通道）→ 总时长 90s 兜底上抛 → 关思考（数值问答不需要，首字快 + 省 token）→ usage 从流的 get_final_message() 取，计入 token 预算
+
+### 横切面
+
+- **trace**：request_id（13 位毫秒时间戳 + 4 位随机 hex）贯穿全链，span 落 SQLite。stage 口径：`pre_*/embed/search/retrieve/gen_first_token/gen_total/e2e/ingest`，status = ok/degraded/error——排障、压测聚合、README 数字同一口径。不上 OTel 全家桶，但字段留了升级路
+- **limits**：50 问/人/天（`DAILY_QUESTION_LIMIT`）+ 500k token/天全局（`DAILY_TOKEN_BUDGET`），计数落 SQLite 按自然日重置；超限给友好提示（429 / 钉钉文本），不是报错——限流是产品行为不是故障
+- **media**：图片原件 `data/media/`，chunk 只存文件名，前端经 `/api/media/` 回显
+
+### 模型拓扑（key 拆分：生成商可独立切换，检索侧固定智谱）
+
+| env | 指向 | 用途 |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | 智谱 | embedding-3（1024 维）/ rerank（已退役留 flag）/ glm-4v-flash（图片描述） |
+| `CHAT_API_KEY` | DeepSeek anthropic 兼容端点 | 生成 + pre-retrieval 小生成，默认 `deepseek-flash`（`ANTHROPIC_BASE_URL` / `ANTHROPIC_CHAT_MODEL` 可换别家）——实测快 4 倍且评测持平 |
+
+## 评测（数字真实跑出来，复现命令都在本仓）
+
+```bash
+python -X utf8 -m eval.run_eval                 # 22 条 × 每条生成 3 次
+python -X utf8 -m eval.run_eval --pre rewrite   # pre-retrieval 四模式消融
+```
+
+### 评测集设计（eval/evalset.py：22 条，四层 × 模态 tag）
+
+| 层 | 条数 | 考什么 |
+|---|---|---|
+| 常规 | 12 | 基本盘：语料里有、问法直白，RAG 应该拿分。含 2 条锚定 2025/云天化新语料、M05 docx 标准样式验收、M07 docx 反样式真实 case（真数字+加粗伪装标题+合并单元格，验章节兜底路径） |
+| 边界 | 6 | 加压形态：短查询 / 跨块聚合（答案分散两块，Top-k 只命中一块也会缺数）/ 图片定性 / 措辞转换（问「董事长」、语料只有「法定代表人」）/ 答案埋在行政文本 / 多轮指代（M06 带 history：off 裸检索「那2025年呢」必挂，改写消解指代后应过） |
+| 综合 | 2 | B 类跨文档：两个公司的表都进 context 才答得全（组间 AND） |
+| 异常 | 2 | 不该做的题：语料里没有（含世界知识有的「氯化钾化学式」——考「只能根据参考资料回答」的约束力），期望拒答不编造 |
+
+每条带模态 tag（表格/正文/图片），指标可按模态拆开看哪类 chunk 检索最弱。
+
+**收题规则**（v1→v5 教训沉淀，写在 evalset.py 头部）：
+
+- **只收有唯一标准答案的题**。原「真实回流」层 4 条线上回收题（分红追问/扣非缩写/eps/口语）收集于单文档时代，6 文档扩容后「公司」无唯一指向——拿旧标准答案判分 = 判无解之题，已撤层；等线上回流带明确对象的问题再入集
+- 题型分类约束：A 明确标准 / B 多文档综合 / C 目标缺失歧义（不入集——澄清反问是 bot 产品功能，当前不存在）/ D 其它（X01/X02 语料外拒答题即 D）
+- **评测集自己的标签也会错**：v1 曾把「董事长是谁」「分红方案」标成语料外异常题，逐 case 核对语料后都翻了——每条「语料外」假设都要拿语料核对过再定标签
+
+### 两层判分（全代码断言，不靠肉眼）
+
+每条 case 两个判分层 + 异常题一个负向断言：
+
+- **expect（检索层标准出处）**：**组间 AND、组内 OR**——跨文档题要求两个公司的表都进 Top-k。候选带 source 锚（多文档库中 type+page 会跨文档假命中，判分只认主语料的块）；异常题 expect=None 不判检索——检索总会返回「最不差的」Top-k，精排分再高也证不了「语料里没有」
+- **assert_groups（生成层）**：每组关键词任一命中、全部组过 = 答对。断言关键词给全格式与缩略两种（"15,134,119,500" / "151.34"），两种写法都吃得住
+- **refute（异常题负向断言）**：拒答词命中 **且** 拒答句之后没有编造内容才算过——「资料中未提及，但据我所知是 KCl」照样判错。词表只收动作词 + 拒答句内命中豁免（「未提及…发展战略…等内容」是元语言解释不是编造；10-30 复盘：模型实际 15/15 拒答，旧判分报 1/3 全是误伤）
+
+**评测环境自带鲁棒性设计**：独立库 `data/eval.db`（锁与生产按文件隔离，无需停服务）；自动导入 sample_reports 全部样本 + 虚构公司年报干扰文档（`eval/distractor.txt`，考检索/归因不被无关文档带偏）；生成探针与线上 Web/bot 走**同一段流式代码**（首字超时重试/关思考同口径）。参数：`--runs`（每条生成次数，默认 3）、`--top-k`（context 消融）、`--pre`（四模式）、`--rerank`。
+
+### 指标口径（按环节拆开——成功率上不去时分得清是检索没捞到还是生成没答好）
+
+- **检索层**：命中@3（历史口径）/ 命中@5（=context 口径）/ Top-1。判据是「该 case 的标准出处**全部**进 Top-k」（组间 AND），本质是二元化的证据 recall@k；经典 recall 的分母需要全语料相关性标注，不可得也不必要——RAG 的目标是 context 不缺证据
+- **生成层**：答对率（关键词组断言）/ 拒绝率（refute 加固后）/ pass@N、pass^N（每题 N 次生成，至少一次对 / 次次对）
+- **过程与成本**：检索中位/P95 ms、生成中位/P95 s、token 合计与均值
+
+### 当前基线（22 条 × 3 次，pre=off）
 
 | 指标 | 数值 | 说明 |
 |---|---|---|
@@ -35,11 +168,9 @@
 | pass@3 / pass^3 | 16/20 · 16/20 | 每题生成 3 次，全对才记 pass^3 |
 | 生成延迟 | p50 1.5s / P95 2.0s | deepseek-flash、关思考 |
 
-（22 条口径 = 21 条 + M07 docx 反样式真实 case；命中绝对数 48/57→48/60 不变——分母变化 + 库重建的 VLM 描述方差，非回归；M05/M07 两类 docx 管线题全绿 ✓Top1）
+（22 条口径 = 21 条 + M07 docx 反样式真实 case；命中绝对数 48/57→48/60 不变——分母变化 + 库重建的 VLM 描述方差，非回归；M05/M07 两类 docx 管线题全绿 ✓Top1。综合层检索 0/6 = 组间 AND 在 Top-5 太严，但 M02 靠 2025 表对比列照样答对——检索锚定比答案所需更严的活例。口径沿革：19 条无 source 锚时代命中@5 64.7% / 答对 ≈63%，单文档时代命中@3 76.5% / 答对 ≈70%，见演进记录）
 
-**统一 Chunk 数据模型**（10-30）：`@dataclass Chunk {text, chunk_type, content, page, section, source}` 一处定义贯穿入库/检索/展示（此前 store 层叫 chunk_type、pipeline 转手改名 type、三个消费方各摸各的键）；检索命中为 `RetrievedChunk(Chunk) + rrf/score`。**章节（section）**：PDF 按中文序号标题正则、docx Heading 样式优先 + 加粗+序号兜底（真实世界 docx 常用加粗伪装标题），standalone 表格块记所在章节，bot 脚注与 Web 来源面板显示「哪份文档哪一节哪一页」；正文块跨章节不硬造（与 page=0 同约定）。章节进可检索文本的 A/B（22 条 × 3 轮两臂）：命中/答对/拒绝全持平=中性，前缀默认不加——source 锚已吃掉表格题检索增益，section 只留元数据与展示。
-
-**Pre-retrieval 消融**（`--pre off/rewrite/hyde/multi` 同库三轮；rewrite=LLM 改写消解多轮指代，hyde=假设文档只换 dense 向量，multi=3 变体+原问四路 RRF 合并）：
+### pre-retrieval 消融（`--pre off/rewrite/hyde/multi` 同库对比；rewrite=LLM 改写消解多轮指代，hyde=假设文档只换 dense 向量，multi=3 变体+原问四路 RRF 合并）
 
 | 模式 | 命中@5 | Top-1 | 答对 | 拒绝 | 检索中位 | 均 token | 结论 |
 |---|---|---|---|---|---|---|---|
@@ -50,13 +181,7 @@
 
 数据修对 > 检索花活：表格块 text 加 source 锚（+26.3pp）吞掉了 pre-retrieval 的几乎全部增益——先修数据再上技巧的活例（rerank 退役后第二个负结果案例，数字都在）。
 
-以上为多文档口径（6 份精选 PDF + 1 份 docx 样本 ≈209 块，21 条四层：常规11/边界6/综合2/异常2，检索为融合序——rerank 层已退役）；旧口径（19 条、表格无 source 锚）命中@5 64.7% / 答对 ≈63%，单文档时代命中@3 76.5% / 答对 ≈70%，见演进记录。综合层检索 0/6=组间 AND 在 Top-5 太严，但 M02 靠 2025 表对比列照样答对——检索锚定比答案所需更严的活例。
-
-评测集只收有唯一标准答案的题：原「真实回流」层 4 条线上回收题（分红追问/扣非缩写/eps/极简口语）收集于单文档时代，6 文档扩容后无唯一答案——继续拿旧标准答案判分等于判无解之题，已撤层；等线上回流带明确对象（公司名/完整上下文）的问题再入集。题型分类约束（eval/evalset.py 头部）：构造题与回流题一视同仁，优先归 A 明确标准题 / B 多文档综合题 / C 目标缺失歧义题，不能归类的进 D 其它（X01/X02 即 D）。
-
-评测集判分加固：异常题要求「拒答词命中 且 没有带出编造内容」（refute 负向断言——「资料中未提及，但 KCl」照样判错）；库内另有虚构公司年报（`eval/distractor.txt`）作干扰文档。评测生成与线上同一段流式代码（首字超时重试/关思考同口径）。多文档适配：检索判分钉死主语料 source（type+page 跨文档会假命中）、构造题带「盐湖股份」限定、断言加年份组；`--top-k` 参数可做 context 消融实验。
-
-**压测**（`python -X utf8 -m loadtest.bench`，60 请求 0 失败）：
+### 压测（`python -X utf8 -m loadtest.bench`，60 请求 0 失败）
 
 | 并发 | p50 | p95 | 吞吐 |
 |---|---|---|---|
@@ -115,17 +240,18 @@ nssm set ragbot AppStderr D:\workspace\ragbot\ragbot_server.log
 nssm start ragbot
 ```
 
-## 演进记录（都有评测数字背书）
+## 演进记录（关键事实与结论）
 
-- 统一数据模型 + 章节元数据（10-30）：Chunk dataclass 收口双名（chunk_type 全链统一，含 evalset/前端）；章节提取两条路（PDF 序号正则 / docx Heading 样式+加粗兜底）入 standalone 块元数据，脚注展示「文档｜章节 p页」；+M07 反样式真实 docx case（万华真数字+伪标题+合并单元格，章节兜底路径全绿）。章节 text 锚 A/B：全指标持平=中性 → 前缀撤、元数据留（RAGBOT_SECTION_ANCHOR=1 可复验）——source 锚已吃掉表格题检索增益的又一实证
-- 异常题判分器去假阳性（10-30）：X01 三轮复跑 3/3→2/3→1/3 波动，探针复盘=**模型实际 15/15 拒答，fail 全是判分器误伤**两种形态——①拒答解释的元语言（「未提及…发展战略…等内容」）②拒答时引用语料原文（年报重要提示的前瞻性陈述免责声明本身就含「未来计划、发展战略」）。修复=refute 词表只收动作词（编造必然用动作词）+ 拒答句内命中豁免；拒答回 100%/编造 0，真编造样本全部照拦
-- 表格 source 锚修复（10-30）：M05（虚构公司 docx 表格题）四模式全挂倒查——独立成块的表格 text 版只有指标+数字，**没有公司名锚，BM25/dense 两路都吃不到**（正文块含公司名但表格块脱离了正文流）。修复=standalone 表格块 text 加 source 前缀（PDF/docx 两管线同修），off 命中 57.9→84.2%（**+26.3pp**），Top-1 47.4→63.2%。教训：多模态 chunk 脱离上下文独立成块时，把来源信息带进可检索文本
-- docx 导入 + pre-retrieval 三模式 A/B（10-30）：python-docx 管线（段/表/图三类 chunk 与 PDF 同构，12 行大表独立成块、图片真 VLM 描述）；pre-retrieval 实现互斥四模式（rewrite/hyde/multi，LLM 失败 5s 降级原问）+ evalset 21 条（+M05 docx 锚定、+M06 多轮指代信号弹——off 裸检索 0/3、改写 3/3）。A/B 拍板：source 锚修复吞掉 pre 增益，off 默认保留（rewrite 拒绝 83.3% 有编造泄漏、hyde/multi 净负），三模式留 flag；附带发现——multi 变体 fan-out 会把语料外题捞到「看起来相关」的内容，护栏变松
-- 评测加固（10-29）：异常题加 refute 负向断言（「未提及，但 KCl」照样判错）、生成探针改走与线上同段流式代码、库内加虚构公司干扰文档、评测迁独立库 data/eval.db（无需停服务、不碰生产库）——重测检索 76.5% 持平、答对 ≈70%（旧口径 76.5% 系单轮幸运值，两轮复跑确认波动在边界题）、拒绝 100% 零编造
-- 语料扩容与多文档评测适配（10-29）：sample_reports 1→6 份精选（盐湖股份 2023/2024/2025 + 云天化 2023/2024/2025，`tools/extract_pages.py` 抽页、结构镜像）；评测适配=检索判分钉死主语料 source（type+page 跨文档假命中）、构造题加公司名、断言加年份组（「不送红股」曾误配云天化派现方案=假阳性教训）、`--top-k` 消融参数；Top-3→5 两轮对比（命中 47.1→58.8%、答对 35.3→≈39%）→ 生产 TOP_K=5。剩硬骨头：B05 分红题（云天化派现块的检索信号强于盐湖行政文本）、行业题 C06/C08/B02
-- 来源标注归因修复（10-29）：探针抓到归因失败（模型把盐湖数字安到云天化头上）→ context 每块加「来源」标注 + system prompt 要求按公司/年份归因——答对 34.9%→52.9%
-- 评测集 v5（10-29）：真实层撤空——4 条回流题多文档后无唯一答案（判分=判无解之题），19 条四层定稿、两轮数字完全一致（命中@5 52.9% / 答对 52.9% / 拒绝 100%）；答案唯一性全量审计：C05 pin「盐湖股份」、B04/C06/C08 pin 年份（2023 版法定代表人是贠红卫、有竞争数字），答案跨源存在的（C01/C03/C04/C07）锚定改组 OR
-- rerank 层退役：智谱 rerank 接口返回无区分度（分数压缩在 0.99999X，排序只靠第七位小数的微差），开着检索净负、延迟 +0.5s——净负退役，`use_rerank` 开关留作换供应商后 A/B
+- **表格 source 锚（10-30）**：独立成块的表格 text 只有指标+数字没公司名，BM25/dense 都吃不到。text 加 `source：` 前缀：命中 57.9→84.2%（**+26.3pp**）、Top-1 47.4→63.2%。结论：多模态 chunk 脱离正文独立成块时，来源必须进可检索文本
+- **pre-retrieval 三模式 A/B（10-30）**：off 全指标最优 → 默认；rewrite 仅 Top-1 +10.5pp 但有编造泄漏 + 延迟×4.2；hyde/multi 净负。三模式留 flag 备用。source 锚吞掉 pre 几乎全部增益——先修数据再上技巧
+- **统一 Chunk 模型 + 章节元数据（10-30）**：chunk_type 双名收口一处定义；section 入独立块元数据与脚注展示（「文档｜章节 p页」）。章节 text 锚 A/B 全指标持平=中性 → 前缀不加（`RAGBOT_SECTION_ANCHOR=1` 可复验）
+- **异常题判分器去假阳性（10-30）**：X01 复盘=模型实际 15/15 拒答、fail 全是判分器误伤（元语言解释 + 引语料原文撞词）。修复=refute 只收动作词 + 拒答句内豁免：拒答回 100%，真编造照拦
+- **docx 导入（10-30）**：python-docx 三类 chunk 与 PDF 同构；+M05 标准样式验收、+M06 多轮指代信号弹（off 裸检索 0/3、rewrite 3/3）、+M07 反样式真实 case 验章节兜底路径
+- **评测加固（10-29）**：+refute 负向断言、生成探针改与线上同段流式代码、+虚构公司干扰文档、评测迁独立库 eval.db——重跑数字持平确认
+- **语料 1→6 份 + 多文档评测适配（10-29）**：判分钉死 source、问句 pin 公司、断言加年份组（「不送红股」曾误配云天化派现=假阳性）；Top-3→5 命中 +11.7pp → 生产 TOP_K=5
+- **来源标注归因（10-29）**：context 每块加来源 + system 要求按公司/年份归因——答对 34.9%→52.9%（此前模型把盐湖数字安到云天化头上）
+- **评测集 v5（10-29）**：回流层撤空（无唯一答案不入集）；答案唯一性全量审计（pin 公司 / pin 年份 / 跨源锚定组 OR）
+- **rerank 退役（10-29）**：智谱 rerank 分数压缩在 0.99999X 饱和无区分度，开着检索净 -11.8pp、延迟 +0.5s——直接走融合序，`use_rerank` 留作换供应商后 A/B
 
 ## License
 
