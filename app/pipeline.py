@@ -9,13 +9,14 @@ web 路由、钉钉 bot、评测脚本三个调用方共享同一套——Milvus
 全调用方同构——评测测的就是线上这条链。
 """
 
+import hashlib
 import os
 import time
 from dataclasses import dataclass
 
 from . import llm, trace
-from .store import (DATA_DIR, MEDIA_DIR, RECALL_K, TOP_K, Chunk, MilvusStore,
-                    RecursiveTextSplitter, parse_docx, parse_pdf)
+from .store import (DATA_DIR, MEDIA_DIR, RECALL_K, TOP_K, Chunk, DocRegistry,
+                    MilvusStore, RecursiveTextSplitter, parse_docx, parse_pdf)
 
 
 @dataclass
@@ -39,6 +40,7 @@ PRE_MODE = os.environ.get("RAGBOT_PRE_MODE", "off")
 embedder = None
 splitter = None
 store = None
+registry = None
 reranker = None
 generator = None
 
@@ -46,7 +48,7 @@ generator = None
 def init(db_path: str | None = None):
     """入口调用：配置检查 → 初始化全部单例。返回 None（失败直接抛 SystemExit）。
     db_path 不传 = 生产库 data/mini_rag.db；评测传 eval.db，与生产数据隔离。"""
-    global embedder, splitter, store, reranker, generator
+    global embedder, splitter, store, registry, reranker, generator
     if not llm._ZHIPU_API_KEY:
         raise SystemExit("未配置智谱 API Key（ANTHROPIC_API_KEY）——embedding/rerank/VLM 都依赖它")
     generator = llm.Generator()
@@ -57,7 +59,9 @@ def init(db_path: str | None = None):
     reranker = llm.Reranker(llm._ZHIPU_API_KEY)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     MEDIA_DIR.mkdir(parents=True, exist_ok=True)
-    store = MilvusStore(db_path or str(DATA_DIR / "mini_rag.db"))
+    db = db_path or str(DATA_DIR / "mini_rag.db")
+    store = MilvusStore(db)
+    registry = DocRegistry(db)          # 文档注册表随库文件隔离（mini_rag_docs.db / eval_docs.db）
 
 
 def _to_entries(hits: list[dict], order: list[int], scores: dict[int, float]) -> list[RetrievedChunk]:
@@ -161,50 +165,68 @@ def build_user_msg(question: str, retrieved: list[dict], history: list[dict] | N
     return (history or []) + [{"role": "user", "content": user_msg}]
 
 
-def ingest_text(text: str, source: str) -> tuple[int, bool, str]:
-    """切块 + 向量化 + 入库一份纯文本文档。幂等：source 已在库则跳过。"""
-    if store.has_source(source):
-        return 0, False, f"[SKIP]「{source}」已在库中"
-    rid = trace.new_request_id()
-    t0 = time.perf_counter()
+def ingest_text(text: str, source: str, replace: bool = False) -> tuple[int, bool, str]:
+    """切块 + 向量化 + 入库一份纯文本文档。幂等与覆盖：source 已在库且未勾覆盖则跳过；
+    覆盖时 md5 相同=内容未变化直接跳过，不同走文档级替换（见 _ingest_rows）。"""
+    old_md5 = store.source_md5(source)
+    if old_md5 is not None and not replace:
+        return 0, False, f"[SKIP]「{source}」已在库中（勾选覆盖重传可更新）"
+    new_md5 = hashlib.md5(text.encode("utf-8")).hexdigest()
+    if old_md5 == new_md5:
+        return 0, False, f"[SKIP]「{source}」已在库中且内容未变化"
     texts = splitter.split_text(text)
     chunks = [Chunk(text=c, chunk_type="text", content=c, page=0) for c in texts]
-    store.insert_rows(chunks, embedder.embed_batch(texts), source)
-    trace.record(rid, "ingest", (time.perf_counter() - t0) * 1000,
-                 meta={"source": source, "chunks": len(texts)})
-    return len(texts), True, f"[OK]「{source}」+{len(texts)} 块"
+    return _ingest_rows(source, chunks, 0, new_md5, old_md5 is not None)
 
 
-def _ingest_rows(source: str, chunks: list[Chunk], vlm_ok: int) -> tuple[int, bool, str]:
-    """多模态 chunk 入库 + ingest span + 结果摘要（ingest_pdf / ingest_docx 共用尾巴）。"""
+def _ingest_rows(source: str, chunks: list[Chunk], vlm_ok: int, md5: str,
+                 replacing: bool) -> tuple[int, bool, str]:
+    """多模态 chunk 入库 + ingest span + 结果摘要（三个 ingest 共用尾巴）。
+    replacing=True（覆盖更新）：**先传后删**——insert 前记下旧块主键、insert 成功后再删。
+    旧版保留到新版确定入座，parse/embed/insert 任一步失败库内容不丢；失败窗口的
+    新旧并存由下次覆盖自愈（重查该 source 全量 ID 一并删掉）。"""
     rid = trace.new_request_id()
     t0 = time.perf_counter()
-    store.insert_rows(chunks, embedder.embed_batch([c.text for c in chunks]), source)
+    old_ids = store.source_ids(source) if replacing else []
+    store.insert_rows(chunks, embedder.embed_batch([c.text for c in chunks]), source, md5)
+    store.delete_ids(old_ids)
     by_type = {t: sum(1 for c in chunks if c.chunk_type == t) for t in ("text", "table", "image")}
     imgs = by_type["image"]
     vlm_note = f"，VLM 描述 {vlm_ok}/{imgs}" if imgs else ""
     labels = {"text": "文本", "table": "表格", "image": "图片"}
     types = " + ".join(f"{v}{labels[k]}" for k, v in by_type.items() if v)
     trace.record(rid, "ingest", (time.perf_counter() - t0) * 1000,
-                 meta={"source": source, "chunks": len(chunks), "vlm_ok": vlm_ok})
-    return len(chunks), True, f"[OK]「{source}」+{len(chunks)} 块（{types}{vlm_note}）"
+                 meta={"source": source, "chunks": len(chunks), "vlm_ok": vlm_ok,
+                       "replaced": len(old_ids)})
+    registry.upsert(source, len(chunks),
+                    {"types": {k: v for k, v in by_type.items() if v}, "vlm_ok": vlm_ok})
+    verb = "替换旧版 " if replacing else ""
+    return len(chunks), True, f"[OK]「{source}」{verb}+{len(chunks)} 块（{types}{vlm_note}）"
 
 
-def ingest_pdf(data: bytes, source: str) -> tuple[int, bool, str]:
-    """多模态分支（PDF）：解析 → 向量化 → 入库。幂等同上。"""
-    if store.has_source(source):
-        return 0, False, f"[SKIP]「{source}」已在库中"
+def ingest_pdf(data: bytes, source: str, replace: bool = False) -> tuple[int, bool, str]:
+    """多模态分支（PDF）：解析 → 向量化 → 入库。幂等与覆盖同 ingest_text。"""
+    old_md5 = store.source_md5(source)
+    if old_md5 is not None and not replace:
+        return 0, False, f"[SKIP]「{source}」已在库中（勾选覆盖重传可更新）"
+    new_md5 = hashlib.md5(data).hexdigest()
+    if old_md5 == new_md5:
+        return 0, False, f"[SKIP]「{source}」已在库中且内容未变化"
     rows, vlm_ok = parse_pdf(data, source, llm._ZHIPU_API_KEY, splitter)
     if not rows:
         return 0, True, f"[WARN]「{source}」未解析出内容（扫描件？本服务只吃有文字层的 PDF）"
-    return _ingest_rows(source, rows, vlm_ok)
+    return _ingest_rows(source, rows, vlm_ok, new_md5, old_md5 is not None)
 
 
-def ingest_docx(data: bytes, source: str) -> tuple[int, bool, str]:
-    """Word 分支（.docx）：与 PDF 管线同构（段落/表格/图片三类 chunk）。幂等同上。"""
-    if store.has_source(source):
-        return 0, False, f"[SKIP]「{source}」已在库中"
+def ingest_docx(data: bytes, source: str, replace: bool = False) -> tuple[int, bool, str]:
+    """Word 分支（.docx）：与 PDF 管线同构（段落/表格/图片三类 chunk）。幂等与覆盖同上。"""
+    old_md5 = store.source_md5(source)
+    if old_md5 is not None and not replace:
+        return 0, False, f"[SKIP]「{source}」已在库中（勾选覆盖重传可更新）"
+    new_md5 = hashlib.md5(data).hexdigest()
+    if old_md5 == new_md5:
+        return 0, False, f"[SKIP]「{source}」已在库中且内容未变化"
     rows, vlm_ok = parse_docx(data, source, llm._ZHIPU_API_KEY, splitter)
     if not rows:
         return 0, True, f"[WARN]「{source}」未解析出内容（空文档？）"
-    return _ingest_rows(source, rows, vlm_ok)
+    return _ingest_rows(source, rows, vlm_ok, new_md5, old_md5 is not None)

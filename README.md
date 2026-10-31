@@ -2,7 +2,7 @@
 
 文档入库（PDF / Word 正文 / 表格 / 图片三模态）→ 混合检索（稠密向量 + BM25 两路召回、RRF 融合）→ 流式生成。**Web 聊天（SSE 打字机）+ 钉钉机器人（Stream 模式免公网）双客户端**，带完整的生产化横切面：评测集、请求级追踪、超时/有限重试/降级、限流与 token 预算、压测数据。
 
-> 源于教学项目 [Mini-RAG](https://github.com/alicexl/Mini-RAG)（三步从零搭 RAG 的原理线）；本仓是其原 step4 应用的产品线独立演化——检索/解析内核在 Mini-RAG 内完成 E2E 与评测验证后迁出，围绕「能上线」补齐工程横切面。
+> 源于教学项目 [Mini-RAG](https://github.com/alicexl/Mini-RAG)（三步从零搭 RAG 的原理线）。
 
 ## 架构
 
@@ -45,8 +45,10 @@ Web 端点（`app/main.py`）：
 | 端点 | 作用 |
 |---|---|
 | `GET /` | 聊天页（app/static/index.html） |
-| `GET /api/status` | 库状态：chunk 数 + 已导入文档清单 |
-| `POST /api/upload` | multipart 上传：.pdf/.docx 走多模态管线，.doc 明确拒绝并引导转存，其余按纯文本；幂等（重复导入跳过） |
+| `GET /api/status` | 库状态：chunk 数 + 文档清单（注册表富化：版本/块数/更新时间） |
+| `POST /api/upload` | multipart 上传：.pdf/.docx 走多模态管线，.doc 明确拒绝并引导转存，其余按纯文本。幂等：同名跳过；`replace=1`（「覆盖同名文档」复选框）走文档级更新——先比对 md5，内容未变直接跳过，变了才先传新块后删旧块 |
+| `GET /api/doc` | 单文档明细（`?source=`）：chunk 类型/页码/章节/文本预览 |
+| `POST /api/delete` | 删除单个文档（JSON `{source}`）：该来源全部 chunk 连同指纹随行消失 |
 | `POST /api/chat` | SSE 流式：先推 `sources`（命中清单：分数/类型/页码/章节/图片链接），再 `delta…` 逐字，末帧 `done` / `error` |
 | `POST /api/clear` | drop collection 重建（比删 .db 干净，避开文件锁） |
 | `GET /api/media/<名>` | 图片 chunk 原图回显（受控目录，无遍历风险） |
@@ -89,12 +91,13 @@ Web 端点（`app/main.py`）：
 
 **纯文本**——直接切块。切块器 RecursiveTextSplitter：chunk_size=400 / overlap=50，分隔符优先级 段落→换行→句读→空格→字符级兜底。
 
-入库幂等：source 已在库（标量过滤查询）即跳过。
+**幂等与文档级更新**：source 已在库且未勾覆盖 → 跳过；勾了覆盖先比对 md5（PDF/docx 算原始字节、纯文本算 utf-8 编码，指纹随 chunk 行存），内容未变直接跳过（零 VLM 零重灌），变了走**先传后删**——insert 前记下旧块主键、insert 成功后再按 ID 删旧（新旧行同 source，只能按 ID 删）。parse/embed/insert 任一步失败旧版不丢；失败窗口的新旧并存由下次覆盖自愈（重查全量 ID 一并删）。schema 含 doc_md5 字段，旧 schema 库在下次启动时自动 drop 重灌（一次性）。
 
 ### 存储与检索：Milvus Lite 库内混合检索
 
 - **单文件库**：生产 `data/mini_rag.db`、评测 `data/eval.db`。单进程文件锁——同一 data 目录同一时刻只允许一个进程打开；web/bot 共库同进程，评测独立库不碰生产、无需停服务
-- **一张 collection 装下一切**：`text`（VARCHAR 65535，jieba analyzer——中文按词切不按字切）→ 库内 **BM25 Function** 自动出 sparse 向量（不用手填）；`vector`（1024 维，HNSW/COSINE）；`source/chunk_type/content/page/section` 标量字段随行存
+- **一张 collection 装下一切**：`text`（VARCHAR 65535，jieba analyzer——中文按词切不按字切）→ 库内 **BM25 Function** 自动出 sparse 向量（不用手填）；`vector`（1024 维，HNSW/COSINE）；`source/chunk_type/content/page/section/doc_md5` 标量字段随行存（doc_md5=文档内容指纹，覆盖更新的「内容未变」守卫，删除文档时随行消失无残留）
+- **文档注册表（Document DB 层）**：`data/<库名>_docs.db`（SQLite，随库文件隔离）只存元数据——内容版本（每次真实替换 +1，SKIP 不计）/ 块数 / 入库统计 / 时间戳；`content_uri` 预留对象存储原文位置（当前不做原文存储）。分层职责：注册表答「有哪些文档、什么状态」，向量库答「该召回哪些内容」；**存在性真值在向量库**，注册表只富化 `/api/status` 与 `/api/doc`，两边永不脑裂。不设 status / index_version / deleted_at——同步流程没有 pending/failed 中间态、删除即时生效，恒值列是死字段
 - **检索一次 `hybrid_search` 库内完成**：dense 路（查询向量，COSINE）+ sparse 路（查询原文进来，库内 jieba 分词打 BM25）各捞 RECALL_K=20 → **RRFRanker(k=60) 融合** → 取 Top-K=5 进 context
 - rerank 层已退役（智谱分数饱和，见可靠性设计表）；pre-retrieval（rewrite/hyde/multi）默认 off（A/B 结论见评测）
 
@@ -242,16 +245,18 @@ nssm start ragbot
 
 ## 演进记录（关键事实与结论）
 
-- **表格 source 锚（10-30）**：独立成块的表格 text 只有指标+数字没公司名，BM25/dense 都吃不到。text 加 `source：` 前缀：命中 57.9→84.2%（**+26.3pp**）、Top-1 47.4→63.2%。结论：多模态 chunk 脱离正文独立成块时，来源必须进可检索文本
-- **pre-retrieval 三模式 A/B（10-30）**：off 全指标最优 → 默认；rewrite 仅 Top-1 +10.5pp 但有编造泄漏 + 延迟×4.2；hyde/multi 净负。三模式留 flag 备用。source 锚吞掉 pre 几乎全部增益——先修数据再上技巧
-- **统一 Chunk 模型 + 章节元数据（10-30）**：chunk_type 双名收口一处定义；section 入独立块元数据与脚注展示（「文档｜章节 p页」）。章节 text 锚 A/B 全指标持平=中性 → 前缀不加（`RAGBOT_SECTION_ANCHOR=1` 可复验）
-- **异常题判分器去假阳性（10-30）**：X01 复盘=模型实际 15/15 拒答、fail 全是判分器误伤（元语言解释 + 引语料原文撞词）。修复=refute 只收动作词 + 拒答句内豁免：拒答回 100%，真编造照拦
-- **docx 导入（10-30）**：python-docx 三类 chunk 与 PDF 同构；+M05 标准样式验收、+M06 多轮指代信号弹（off 裸检索 0/3、rewrite 3/3）、+M07 反样式真实 case 验章节兜底路径
-- **评测加固（10-29）**：+refute 负向断言、生成探针改与线上同段流式代码、+虚构公司干扰文档、评测迁独立库 eval.db——重跑数字持平确认
-- **语料 1→6 份 + 多文档评测适配（10-29）**：判分钉死 source、问句 pin 公司、断言加年份组（「不送红股」曾误配云天化派现=假阳性）；Top-3→5 命中 +11.7pp → 生产 TOP_K=5
-- **来源标注归因（10-29）**：context 每块加来源 + system 要求按公司/年份归因——答对 34.9%→52.9%（此前模型把盐湖数字安到云天化头上）
-- **评测集 v5（10-29）**：回流层撤空（无唯一答案不入集）；答案唯一性全量审计（pin 公司 / pin 年份 / 跨源锚定组 OR）
-- **rerank 退役（10-29）**：智谱 rerank 分数压缩在 0.99999X 饱和无区分度，开着检索净 -11.8pp、延迟 +0.5s——直接走融合序，`use_rerank` 留作换供应商后 A/B
+- **文档注册表（Document DB 层）**：SQLite 每库一表（`data/<库名>_docs.db`）只存元数据——内容版本（每次真实替换 +1，SKIP/失败不计）/ 块数 / 入库统计 / 时间戳，`content_uri` 预留原文对象存储（当前不做）；**存在性真值留向量库**、注册表只富化 status 面板，两边永不脑裂；不设 status / index_version / deleted_at——同步流程没有中间态，恒值列是死字段
+- **单文档增删改查**：覆盖更新（`replace=1`：md5 守卫——内容未变直接跳过；先传后删——旧版保留到新版入座，失败不丢内容，新旧并存由下次覆盖自愈）+ 单文档删除（指纹随行消失）+ 单文档明细查看；schema 加 doc_md5，旧库启动时自动重灌一次
+- **表格 source 锚**：独立成块的表格 text 只有指标+数字没公司名，BM25/dense 都吃不到。text 加 `source：` 前缀：命中 57.9→84.2%（**+26.3pp**）、Top-1 47.4→63.2%。结论：多模态 chunk 脱离正文独立成块时，来源必须进可检索文本
+- **pre-retrieval 三模式 A/B**：off 全指标最优 → 默认；rewrite 仅 Top-1 +10.5pp 但有编造泄漏 + 延迟×4.2；hyde/multi 净负。三模式留 flag 备用。source 锚吞掉 pre 几乎全部增益——先修数据再上技巧
+- **统一 Chunk 模型 + 章节元数据**：chunk_type 双名收口一处定义；section 入独立块元数据与脚注展示（「文档｜章节 p页」）。章节 text 锚 A/B 全指标持平=中性 → 前缀不加（`RAGBOT_SECTION_ANCHOR=1` 可复验）
+- **异常题判分器去假阳性**：X01 复盘=模型实际 15/15 拒答、fail 全是判分器误伤（元语言解释 + 引语料原文撞词）。修复=refute 只收动作词 + 拒答句内豁免：拒答回 100%，真编造照拦
+- **docx 导入**：python-docx 三类 chunk 与 PDF 同构；+M05 标准样式验收、+M06 多轮指代信号弹（off 裸检索 0/3、rewrite 3/3）、+M07 反样式真实 case 验章节兜底路径
+- **评测加固**：+refute 负向断言、生成探针改与线上同段流式代码、+虚构公司干扰文档、评测迁独立库 eval.db——重跑数字持平确认
+- **语料 1→6 份 + 多文档评测适配**：判分钉死 source、问句 pin 公司、断言加年份组（「不送红股」曾误配云天化派现=假阳性）；Top-3→5 命中 +11.7pp → 生产 TOP_K=5
+- **来源标注归因**：context 每块加来源 + system 要求按公司/年份归因——答对 34.9%→52.9%（此前模型把盐湖数字安到云天化头上）
+- **评测集 v5**：回流层撤空（无唯一答案不入集）；答案唯一性全量审计（pin 公司 / pin 年份 / 跨源锚定组 OR）
+- **rerank 退役**：智谱 rerank 分数压缩在 0.99999X 饱和无区分度，开着检索净 -11.8pp、延迟 +0.5s——直接走融合序，`use_rerank` 留作换供应商后 A/B
 
 ## License
 

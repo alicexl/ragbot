@@ -3,7 +3,9 @@
 路由（与数据流）：
   GET  /                聊天页（app/static/index.html）
   GET  /api/status      库状态（chunk 数 + 文档清单）
-  POST /api/upload      multipart 上传 → 切块/向量化/入库（幂等；PDF/Word 走多模态解析）
+  GET  /api/doc         单文档明细（?source=：chunk 类型/页码/章节/文本预览）
+  POST /api/upload      multipart 上传 → 切块/向量化/入库（幂等；replace=1 时文档级覆盖更新）
+  POST /api/delete      删除单个文档（JSON {source}）
   POST /api/clear       清空向量库
   POST /api/chat        SSE 流式回答（sources → delta… → done / error）
   GET  /api/media/<名>   图片 chunk 原图回显
@@ -37,30 +39,60 @@ def index():
 
 @app.get("/api/status")
 def status():
-    """左栏库状态：现有多少 chunk、已导入哪些文档（按来源去重）。"""
-    return jsonify(chunks=pipeline.store.chunk_count(),
-                   documents=pipeline.store.sources())
+    """左栏库状态：chunk 数 + 文档清单。存在性真值在向量库（sources()），
+    注册表只做富化（版本/块数/更新时间）——两边永不脑裂。"""
+    documents = [{"source": s, **(pipeline.registry.get(s) or {})}
+                 for s in pipeline.store.sources()]
+    return jsonify(chunks=pipeline.store.chunk_count(), documents=documents)
 
 
 @app.post("/api/upload")
 def upload():
-    """「导入」端点：multipart 真上传。按扩展名分流：.pdf 走多模态解析管线，其余按纯文本。"""
+    """「导入」端点：multipart 真上传。按扩展名分流：.pdf 走多模态解析管线，其余按纯文本。
+    replace=1（前端「覆盖同名文档」复选框）：文档级覆盖更新——md5 相同跳过，不同先传新块后删旧块。"""
     files = request.files.getlist("files")
     if not files:
         return jsonify(error="未收到文件（multipart 字段名须为 files）"), 400
+    replace = request.form.get("replace") == "1"
     notes = []
     for f in files:
         source = Path(f.filename).stem        # source 取文件名（去扩展名，幂等键）
         name_l = f.filename.lower()
         if name_l.endswith(".pdf"):
-            notes.append(pipeline.ingest_pdf(f.read(), source)[2])
+            notes.append(pipeline.ingest_pdf(f.read(), source, replace=replace)[2])
         elif name_l.endswith(".docx"):
-            notes.append(pipeline.ingest_docx(f.read(), source)[2])
+            notes.append(pipeline.ingest_docx(f.read(), source, replace=replace)[2])
         elif name_l.endswith(".doc"):
             notes.append(f"[ERR]「{source}」旧版 .doc 不支持：请在 Word 里转存为 .docx 再上传")
         else:
-            notes.append(pipeline.ingest_text(f.read().decode("utf-8", errors="replace"), source)[2])
+            notes.append(pipeline.ingest_text(f.read().decode("utf-8", errors="replace"),
+                                              source, replace=replace)[2])
     return jsonify(chunks=pipeline.store.chunk_count(), notes=notes)
+
+
+@app.get("/api/doc")
+def doc():
+    """单文档明细：chunk 类型/页码/章节/可检索文本预览（文档清单点名展开）。"""
+    source = request.args.get("source", "").strip()
+    if not source:
+        return jsonify(error="source 不能为空"), 400
+    return jsonify(source=source, doc=pipeline.registry.get(source),
+                   chunks=pipeline.store.doc_chunks(source))
+
+
+@app.post("/api/delete")
+def delete():
+    """删除单个文档：该 source 全部 chunk（含 doc_md5 指纹，随行消失无残留）。"""
+    body = request.get_json(silent=True) or {}
+    source = str(body.get("source", "")).strip()
+    if not source:
+        return jsonify(error="source 不能为空"), 400
+    if pipeline.store.source_md5(source) is None:
+        return jsonify(error=f"「{source}」不在库中"), 404
+    pipeline.store.delete_source(source)
+    pipeline.registry.remove(source)
+    return jsonify(chunks=pipeline.store.chunk_count(),
+                   documents=pipeline.store.sources())
 
 
 @app.get("/api/media/<name>")
@@ -71,8 +103,9 @@ def media(name):
 
 @app.post("/api/clear")
 def clear():
-    """「清空」端点：drop 掉 collection 重建（.db 文件保留，库回到空）。"""
+    """「清空」端点：drop 掉 collection 重建（.db 文件保留，库回到空），注册表同步清空。"""
     pipeline.store.clear()
+    pipeline.registry.clear()
     return jsonify(chunks=0, documents=[])
 
 

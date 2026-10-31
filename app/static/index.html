@@ -25,6 +25,15 @@
   #side .card { white-space: pre-wrap; }
   #upload-note { font-size: 12px; color: #6a737d; white-space: pre-wrap; min-height: 18px; }
   .hint { font-size: 12px; color: #8b949e; margin: 0; }
+  #replace-label { font-size: 12px; color: #57606f; display: flex; align-items: center; gap: 4px; }
+  .doc-row { display: flex; align-items: center; gap: 6px; }
+  .doc-name { flex: 1; color: #1f6feb; cursor: pointer; overflow: hidden;
+              text-overflow: ellipsis; white-space: nowrap; }
+  .doc-meta { font-size: 11px; color: #8b949e; flex-shrink: 0; }
+  .doc-del { border: none; background: none; color: #cf222e; cursor: pointer;
+             font-size: 12px; padding: 0; }
+  #doc-detail { display: none; color: #57606a; max-height: 300px; overflow-y: auto; }
+  #doc-detail .chunk { border-top: 1px dashed #e1e4e8; padding: 4px 0; }
 
   .btn {
     display: inline-block; padding: 7px 14px; border-radius: 6px; border: 1px solid #d0d7de;
@@ -67,10 +76,12 @@
   <!-- 左栏：文档管理 -->
   <aside id="side">
     <div id="status" class="card">加载中…</div>
+    <div id="doc-detail" class="card"></div>
     <!-- 浏览器原生文件框：hidden 掉 input 本体，label 当按钮用；multiple 支持一次多选 -->
-    <input type="file" id="file" multiple accept=".md,.txt,.pdf" hidden>
+    <input type="file" id="file" multiple accept=".md,.txt,.pdf,.docx" hidden>
     <label for="file" class="btn primary">导入</label>
     <button id="clear" class="btn danger">清空</button>
+    <label id="replace-label"><input type="checkbox" id="replace">覆盖同名文档（内容变了才重灌）</label>
     <div id="upload-note"></div>
     <p class="hint">示例语料在 sample_reports/（年报精选页 PDF 含表格图片，md 节选为纯文本）</p>
   </aside>
@@ -98,13 +109,70 @@ let busy = false;
 
 /* ---------- 左栏：状态 / 导入 / 清空 ---------- */
 
+const fmtTime = (t) => t ? new Date(t * 1000).toLocaleString("zh-CN", {
+  month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit",
+}) : "";
+
 async function loadStatus() {
   const r = await fetch("/api/status");
   const s = await r.json();
-  const lines = [`向量库：${s.chunks} 个 chunk`, "", "已导入文档："];
-  lines.push(...(s.documents.length ? s.documents.map((d) => `- ${d}`) : ["-（空，请点「导入」选择文档）"]));
-  $("status").textContent = lines.join("\n");
+  const box = $("status");
+  box.textContent = "";                        // 文档行用 DOM 构建：文件名只进 textContent，不进 innerHTML
+  box.append(`向量库：${s.chunks} 个 chunk\n\n已导入文档（点名看明细）：`);
+  if (!s.documents.length) box.append("\n（空，请点「导入」选择文档）");
+  for (const d of s.documents) {
+    const row = document.createElement("div");
+    row.className = "doc-row";
+    const name = document.createElement("span");
+    name.className = "doc-name";
+    name.textContent = d.source;
+    name.title = "点击查看 chunk 明细";
+    const meta = document.createElement("span");
+    meta.className = "doc-meta";
+    meta.textContent = d.content_version
+      ? `v${d.content_version} · ${d.chunk_count}块 · ${fmtTime(d.updated_at)}` : "";
+    const del = document.createElement("button");
+    del.className = "doc-del";
+    del.textContent = "删";
+    row.append(name, meta, del);
+    box.append(row);
+  }
 }
+
+// 单文档查（点名展开）与删（行内按钮），事件委托在 status 面板上
+$("status").addEventListener("click", async (e) => {
+  const row = e.target.closest(".doc-row");
+  if (!row) return;
+  const source = row.querySelector(".doc-name").textContent;
+  if (e.target.classList.contains("doc-del")) {
+    if (!confirm(`删除文档「${source}」？不可恢复`)) return;
+    const r = await fetch("/api/delete", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source }),
+    });
+    const s = await r.json();
+    note(s.error ? `删除失败：${s.error}` : `已删除「${source}」`);
+    $("doc-detail").style.display = "none";
+    loadStatus();
+    return;
+  }
+  const r = await fetch(`/api/doc?source=${encodeURIComponent(source)}`);
+  const s = await r.json();
+  const box = $("doc-detail");
+  box.textContent = "";
+  const labels = { text: "正文", table: "表格", image: "图片" };
+  const reg = s.doc ? `v${s.doc.content_version} · 更新于 ${fmtTime(s.doc.updated_at)} · ` : "";
+  box.append(s.error ? `查询失败：${s.error}` : `「${source}」${reg}共 ${s.chunks.length} 块：`);
+  for (const c of s.chunks || []) {
+    const line = document.createElement("div");
+    line.className = "chunk";
+    const loc = (c.page ? ` p${c.page}` : "") + (c.section ? `｜${c.section}` : "");
+    line.textContent = `[${labels[c.chunk_type] || c.chunk_type}${loc}] ${
+      c.text.replace(/\n/g, " ").slice(0, 120)}`;
+    box.append(line);
+  }
+  box.style.display = "block";
+});
 
 function note(text) {
   $("upload-note").textContent = text || "";
@@ -117,6 +185,7 @@ $("file").addEventListener("change", async () => {
   note("导入中…（切块 + 向量化）");
   const fd = new FormData();
   files.forEach((f) => fd.append("files", f));
+  if ($("replace").checked) fd.append("replace", "1");   // 覆盖同名：服务端比对 md5，内容未变仍会跳过
   const r = await fetch("/api/upload", { method: "POST", body: fd });
   const s = await r.json();
   note(s.notes ? s.notes.join("\n") : s.error || "导入失败");

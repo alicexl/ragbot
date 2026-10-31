@@ -7,8 +7,11 @@ Milvus Lite 单文件库（data/mini_rag.db）：一张 collection 装下「原�
 
 import hashlib
 import io
+import json
 import os
 import re
+import sqlite3
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -124,8 +127,8 @@ class MilvusStore:
         旧版（纯文本）schema 缺多模态字段 → drop 重建（重传语料即可）。"""
         if self.client.has_collection(self.COLLECTION):
             fields = {f["name"] for f in self.client.describe_collection(self.COLLECTION)["fields"]}
-            if "chunk_type" not in fields or "section" not in fields:
-                self.client.drop_collection(self.COLLECTION)   # 旧 schema（缺多模态/章节字段）→ 重灌
+            if "chunk_type" not in fields or "section" not in fields or "doc_md5" not in fields:
+                self.client.drop_collection(self.COLLECTION)   # 旧 schema（缺多模态/章节/指纹字段）→ 重灌
             else:
                 self.client.load_collection(self.COLLECTION)
                 return
@@ -147,6 +150,7 @@ class MilvusStore:
         schema.add_field("content", DataType.VARCHAR, max_length=65535)  # 命中时回填给 LLM 的原文（表格=HTML）
         schema.add_field("page", DataType.INT64)                          # PDF 页码（非 PDF 语料 = 0）
         schema.add_field("section", DataType.VARCHAR, max_length=128)     # 章节名（standalone 块；正文跨章节为空）
+        schema.add_field("doc_md5", DataType.VARCHAR, max_length=32)      # 文档内容指纹（同 source 各行冗余同值：覆盖更新的「内容未变」守卫 + 删除即指纹消失）
 
         index = self.client.prepare_index_params()
         index.add_index(field_name="vector", index_type="HNSW", metric_type="COSINE",
@@ -156,17 +160,40 @@ class MilvusStore:
         self.client.create_collection(self.COLLECTION, schema=schema, index_params=index)
         self.client.load_collection(self.COLLECTION)
 
-    def insert_rows(self, chunks: list[Chunk], vectors: list[list[float]], source: str):
-        """入库即持久化（库内 WAL 落盘）。source 统一在这里补进每一行（幂等键 + 展示）。"""
+    def insert_rows(self, chunks: list[Chunk], vectors: list[list[float]], source: str,
+                    md5: str = ""):
+        """入库即持久化（库内 WAL 落盘）。source 与 doc_md5 统一在这里补进每一行。"""
         self.client.insert(self.COLLECTION,
-                           [{**asdict(c), "source": source, "vector": v}
+                           [{**asdict(c), "source": source, "doc_md5": md5, "vector": v}
                             for c, v in zip(chunks, vectors)])
 
-    def has_source(self, source: str) -> bool:
-        """幂等判断：该来源是否已在库（标量过滤查询）。"""
+    def source_md5(self, source: str) -> str | None:
+        """该来源的文档指纹；None = 不在库。一次查询兼做幂等判断与「内容未变」守卫。"""
+        rows = self.client.query(self.COLLECTION, filter=f'source == "{source}"',
+                                 output_fields=["doc_md5"], limit=1)
+        return rows[0]["doc_md5"] if rows else None
+
+    def source_ids(self, source: str) -> list[int]:
+        """该来源全部 chunk 的主键（覆盖更新删旧块用——新旧行同 source，只能按 ID 删旧）。"""
         rows = self.client.query(self.COLLECTION, filter=f'source == "{source}"',
                                  output_fields=["id"])
-        return bool(rows)
+        return [r["id"] for r in rows]
+
+    def delete_ids(self, ids: list[int]) -> None:
+        """按主键删行：覆盖更新收尾（新块入座后清走上一代），失败自愈=下次覆盖重查全量 ID。"""
+        if ids:
+            self.client.delete(self.COLLECTION, filter=f'id in [{",".join(map(str, ids))}]')
+
+    def delete_source(self, source: str) -> None:
+        """删除单个文档（该 source 全部行，doc_md5 随行消失，无残留记录）。"""
+        self.client.delete(self.COLLECTION, filter=f'source == "{source}"')
+
+    def doc_chunks(self, source: str) -> list[dict]:
+        """单文档明细：chunk 类型/页码/章节/可检索文本预览（管理端「查」用）。"""
+        rows = self.client.query(self.COLLECTION, filter=f'source == "{source}"',
+                                 output_fields=["id", "chunk_type", "page", "section", "text"],
+                                 limit=16384)
+        return sorted(rows, key=lambda r: r["id"])
 
     def hybrid_search(self, query: str, query_vec: list[float], top_k: int):
         """两路召回 + RRF 融合，库内一步完成。返回命中列表（含 text/source/chunk_type/content/page）。"""
@@ -194,6 +221,58 @@ class MilvusStore:
         """清空：drop 掉 collection 重建——比删 .db 文件干净，也避开文件锁。"""
         self.client.drop_collection(self.COLLECTION)
         self._ensure_collection()
+
+
+class DocRegistry:
+    """文档注册表（Document DB 层）：每库一个 SQLite（data/mini_rag.db → data/mini_rag_docs.db），
+    只存元数据——有哪些文档、内容版本、块数、入库统计、时间戳；原始文件不入库
+    （content_uri 预留对象存储位置，当前恒 NULL）。同步流程没有 pending/failed 中间态、
+    删除即时生效，故不设 status / deleted_at / index_version（恒值的列是死字段）。
+    存在性真值仍在向量库：status 面板以 Milvus sources() 为准、本表只做富化，永不脑裂。"""
+
+    def __init__(self, db_path: str):
+        self.db_path = str(Path(db_path).with_name(Path(db_path).stem + "_docs.db"))
+        with self._conn() as c:
+            c.execute("""CREATE TABLE IF NOT EXISTS documents(
+                source          TEXT PRIMARY KEY,      -- 文档键（=文件名 stem，与向量库 source 一致）
+                content_uri     TEXT,                  -- 预留：对象存储原文位置（当前恒 NULL）
+                content_version INTEGER NOT NULL DEFAULT 1,  -- 内容版本，每次实际替换 +1
+                chunk_count     INTEGER NOT NULL,      -- 当前生效块数
+                meta            TEXT NOT NULL DEFAULT '{}',  -- 入库统计 JSON（分类型块数/VLM 成功率）
+                created_at      REAL NOT NULL,
+                updated_at      REAL NOT NULL)""")
+
+    def _conn(self) -> sqlite3.Connection:
+        c = sqlite3.connect(self.db_path)
+        c.row_factory = sqlite3.Row
+        return c
+
+    def upsert(self, source: str, chunk_count: int, meta: dict) -> None:
+        """入库/覆盖成功后调用：首次插入 version=1，此后每次实际替换 +1——
+        SKIP 路径不触发表写，天然只数真实替换。"""
+        now = time.time()
+        with self._conn() as c:
+            c.execute("""INSERT INTO documents(source, content_uri, content_version,
+                              chunk_count, meta, created_at, updated_at)
+                          VALUES(?, NULL, 1, ?, ?, ?, ?)
+                          ON CONFLICT(source) DO UPDATE SET
+                              content_version = content_version + 1,
+                              chunk_count = excluded.chunk_count,
+                              meta = excluded.meta, updated_at = excluded.updated_at""",
+                      (source, chunk_count, json.dumps(meta, ensure_ascii=False), now, now))
+
+    def get(self, source: str) -> dict | None:
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM documents WHERE source=?", (source,)).fetchone()
+        return dict(row) if row else None
+
+    def remove(self, source: str) -> None:
+        with self._conn() as c:
+            c.execute("DELETE FROM documents WHERE source=?", (source,))
+
+    def clear(self) -> None:
+        with self._conn() as c:
+            c.execute("DELETE FROM documents")
 
 
 # ================================================================
