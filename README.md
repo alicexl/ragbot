@@ -207,6 +207,7 @@ python -X utf8 -m eval.run_eval --pre rewrite   # pre-retrieval 四模式消融
 | pre-retrieval 层 | 5s 超时、不重试 | LLM 改写/假设文档/多路变体失败即降级原问直检（trace 记 degraded）——降级就是容错，与 rerank 同哲学 |
 | 限流 | 50 问/人/天（`DAILY_QUESTION_LIMIT`） | 超限友好提示（429 / 钉钉文本），不是报错 |
 | token 预算 | 500k/天全局（`DAILY_TOKEN_BUDGET`） | 防单人/单日烧穿配额 |
+| 同文档并发写锁 | 进程内 per-source Lock | ingest/delete 同 source 串行化（检查→解析→写入原子化）——并发上传同一文档会串行成「一存一 SKIP」，否则双入库且 md5 守卫对同内容并存不自愈（实证修复）；跨进程由 Milvus 文件锁兜底 |
 | 追踪 | request_id 贯穿全链 | span 落 SQLite，按 stage 聚合 p50/p95/降级数——排障、压测、巡检同一口径 |
 
 ## 快速开始
@@ -247,6 +248,7 @@ nssm start ragbot
 
 ## 演进记录（关键事实与结论）
 
+- **per-source 并发写锁**：与页面并发上传同一文档 → 两请求都过 has_source 检查 → 双入库，而 md5 守卫对「同内容并存」是 SKIP 不自愈（11-02 生产实证，v2 版本号暴露）——修为 ingest/delete 全程持同 source 进程锁，并发串行成「一存一 SKIP」
 - **per-entity fan-out（11-02）**：多实体问题（M01/M02 型）按实体拆路检索——**who 圈定范围**（source 标量过滤）+ **when/what 排序**（残句），各实体路轮转占坑；综合层检索 0/6 修通，答对 80→95%、pass@3 16→19/20。三个坑连环：①纯 RRF 合并会让单路第一名被跨路噪声挤掉（distractor 挤掉云天化 rank-1）→ 改轮转配额占坑；②实体名留在子查询里会让释义表（实体名词频饱和 ×25）霸榜 → 过滤圈定 + 残句排序；③pymilvus 的 `hybrid_search` 不收 filter 参数、塞 `**kwargs` **静默吞掉不报错** → 过滤挂到 `AnnSearchRequest` 上。附带发现：云天化 2025 年报的 2024 列是「调整后｜调整前」双列（同一控制下企业合并追溯调整，营收 616.54 vs 615.37 亿）——模型引调整后数并主动标注口径是对的，断言两口径全收，判分不该罚对答案
 - **文档注册表（Document DB 层）**：SQLite 每库一表（`data/<库名>_docs.db`）只存元数据——内容版本（每次真实替换 +1，SKIP/失败不计）/ 块数 / 入库统计 / 时间戳，`content_uri` 预留原文对象存储（当前不做）；**存在性真值留向量库**、注册表只富化 status 面板，两边永不脑裂；不设 status / index_version / deleted_at——同步流程没有中间态，恒值列是死字段
 - **单文档增删改查**：覆盖更新（`replace=1`：md5 守卫——内容未变直接跳过；先传后删——旧版保留到新版入座，失败不丢内容，新旧并存由下次覆盖自愈）+ 单文档删除（指纹随行消失）+ 单文档明细查看；schema 加 doc_md5，旧库启动时自动重灌一次

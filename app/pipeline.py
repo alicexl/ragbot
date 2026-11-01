@@ -12,6 +12,7 @@ web 路由、钉钉 bot、评测脚本三个调用方共享同一套——Milvus
 import hashlib
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass
 
@@ -73,6 +74,19 @@ def _to_entries(hits: list[dict], order: list[int], scores: dict[int, float]) ->
                            source=h["entity"]["source"],
                            rrf=h["distance"], score=scores.get(i))
             for i in order for h in [hits[i]]]
+
+
+_locks: dict[str, threading.Lock] = {}
+_locks_guard = threading.Lock()
+
+
+def source_lock(source: str) -> threading.Lock:
+    """同 source 的 ingest/delete 串行化（11-02 实证修复：与页面并发上传同一文档
+    → 两请求都过 has_source 检查 → 双入库，而 md5 守卫对「同内容并存」是 SKIP
+    不自愈）。按文档粒度、进程内——服务单进程，跨进程由 Milvus 文件锁兜底；
+    锁只增不删（每文档一把，量级=文档数，不值得回收）。"""
+    with _locks_guard:
+        return _locks.setdefault(source, threading.Lock())
 
 
 def detect_entities(question: str) -> list[tuple[str, list[str]]]:
@@ -221,16 +235,18 @@ def build_user_msg(question: str, retrieved: list[dict], history: list[dict] | N
 
 def ingest_text(text: str, source: str, replace: bool = False) -> tuple[int, bool, str]:
     """切块 + 向量化 + 入库一份纯文本文档。幂等与覆盖：source 已在库且未勾覆盖则跳过；
-    覆盖时 md5 相同=内容未变化直接跳过，不同走文档级替换（见 _ingest_rows）。"""
-    old_md5 = store.source_md5(source)
-    if old_md5 is not None and not replace:
-        return 0, False, f"[SKIP]「{source}」已在库中（勾选覆盖重传可更新）"
-    new_md5 = hashlib.md5(text.encode("utf-8")).hexdigest()
-    if old_md5 == new_md5:
-        return 0, False, f"[SKIP]「{source}」已在库中且内容未变化"
-    texts = splitter.split_text(text)
-    chunks = [Chunk(text=c, chunk_type="text", content=c, page=0) for c in texts]
-    return _ingest_rows(source, chunks, 0, new_md5, old_md5 is not None)
+    覆盖时 md5 相同=内容未变化直接跳过，不同走文档级替换（见 _ingest_rows）。
+    全程持 per-source 锁——检查与写入原子化，并发同文档上传串行成 一存一 SKIP。"""
+    with source_lock(source):
+        old_md5 = store.source_md5(source)
+        if old_md5 is not None and not replace:
+            return 0, False, f"[SKIP]「{source}」已在库中（勾选覆盖重传可更新）"
+        new_md5 = hashlib.md5(text.encode("utf-8")).hexdigest()
+        if old_md5 == new_md5:
+            return 0, False, f"[SKIP]「{source}」已在库中且内容未变化"
+        texts = splitter.split_text(text)
+        chunks = [Chunk(text=c, chunk_type="text", content=c, page=0) for c in texts]
+        return _ingest_rows(source, chunks, 0, new_md5, old_md5 is not None)
 
 
 def _ingest_rows(source: str, chunks: list[Chunk], vlm_ok: int, md5: str,
@@ -259,28 +275,30 @@ def _ingest_rows(source: str, chunks: list[Chunk], vlm_ok: int, md5: str,
 
 
 def ingest_pdf(data: bytes, source: str, replace: bool = False) -> tuple[int, bool, str]:
-    """多模态分支（PDF）：解析 → 向量化 → 入库。幂等与覆盖同 ingest_text。"""
-    old_md5 = store.source_md5(source)
-    if old_md5 is not None and not replace:
-        return 0, False, f"[SKIP]「{source}」已在库中（勾选覆盖重传可更新）"
-    new_md5 = hashlib.md5(data).hexdigest()
-    if old_md5 == new_md5:
-        return 0, False, f"[SKIP]「{source}」已在库中且内容未变化"
-    rows, vlm_ok = parse_pdf(data, source, llm._ZHIPU_API_KEY, splitter)
-    if not rows:
-        return 0, True, f"[WARN]「{source}」未解析出内容（扫描件？本服务只吃有文字层的 PDF）"
-    return _ingest_rows(source, rows, vlm_ok, new_md5, old_md5 is not None)
+    """多模态分支（PDF）：解析 → 向量化 → 入库。幂等与覆盖同 ingest_text（含 per-source 锁）。"""
+    with source_lock(source):
+        old_md5 = store.source_md5(source)
+        if old_md5 is not None and not replace:
+            return 0, False, f"[SKIP]「{source}」已在库中（勾选覆盖重传可更新）"
+        new_md5 = hashlib.md5(data).hexdigest()
+        if old_md5 == new_md5:
+            return 0, False, f"[SKIP]「{source}」已在库中且内容未变化"
+        rows, vlm_ok = parse_pdf(data, source, llm._ZHIPU_API_KEY, splitter)
+        if not rows:
+            return 0, True, f"[WARN]「{source}」未解析出内容（扫描件？本服务只吃有文字层的 PDF）"
+        return _ingest_rows(source, rows, vlm_ok, new_md5, old_md5 is not None)
 
 
 def ingest_docx(data: bytes, source: str, replace: bool = False) -> tuple[int, bool, str]:
     """Word 分支（.docx）：与 PDF 管线同构（段落/表格/图片三类 chunk）。幂等与覆盖同上。"""
-    old_md5 = store.source_md5(source)
-    if old_md5 is not None and not replace:
-        return 0, False, f"[SKIP]「{source}」已在库中（勾选覆盖重传可更新）"
-    new_md5 = hashlib.md5(data).hexdigest()
-    if old_md5 == new_md5:
-        return 0, False, f"[SKIP]「{source}」已在库中且内容未变化"
-    rows, vlm_ok = parse_docx(data, source, llm._ZHIPU_API_KEY, splitter)
-    if not rows:
-        return 0, True, f"[WARN]「{source}」未解析出内容（空文档？）"
-    return _ingest_rows(source, rows, vlm_ok, new_md5, old_md5 is not None)
+    with source_lock(source):
+        old_md5 = store.source_md5(source)
+        if old_md5 is not None and not replace:
+            return 0, False, f"[SKIP]「{source}」已在库中（勾选覆盖重传可更新）"
+        new_md5 = hashlib.md5(data).hexdigest()
+        if old_md5 == new_md5:
+            return 0, False, f"[SKIP]「{source}」已在库中且内容未变化"
+        rows, vlm_ok = parse_docx(data, source, llm._ZHIPU_API_KEY, splitter)
+        if not rows:
+            return 0, True, f"[WARN]「{source}」未解析出内容（空文档？）"
+        return _ingest_rows(source, rows, vlm_ok, new_md5, old_md5 is not None)

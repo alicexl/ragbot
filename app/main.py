@@ -87,10 +87,11 @@ def delete():
     source = str(body.get("source", "")).strip()
     if not source:
         return jsonify(error="source 不能为空"), 400
-    if pipeline.store.source_md5(source) is None:
-        return jsonify(error=f"「{source}」不在库中"), 404
-    pipeline.store.delete_source(source)
-    pipeline.registry.remove(source)
+    with pipeline.source_lock(source):     # 与同文档的 ingest 串行化，防删到一半被写入
+        if pipeline.store.source_md5(source) is None:
+            return jsonify(error=f"「{source}」不在库中"), 404
+        pipeline.store.delete_source(source)
+        pipeline.registry.remove(source)
     return jsonify(chunks=pipeline.store.chunk_count(),
                    documents=pipeline.store.sources())
 
