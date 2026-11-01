@@ -195,14 +195,19 @@ class MilvusStore:
                                  limit=16384)
         return sorted(rows, key=lambda r: r["id"])
 
-    def hybrid_search(self, query: str, query_vec: list[float], top_k: int):
-        """两路召回 + RRF 融合，库内一步完成。返回命中列表（含 text/source/chunk_type/content/page）。"""
+    def hybrid_search(self, query: str, query_vec: list[float], top_k: int,
+                      filter: str = ""):
+        """两路召回 + RRF 融合，库内一步完成。filter 为 Milvus 标量过滤表达式
+        （per-entity fan-out 用 source in [...] 圈定公司范围）——注意过滤挂在
+        AnnSearchRequest 上：本版 pymilvus 的 hybrid_search 不收 filter 参数，
+        塞进 **kwargs 会被静默吞掉（踩过）。"""
+        kw = {"filter": filter} if filter else {}
         dense = AnnSearchRequest(          # 稠密路：语义相近
             data=[query_vec], anns_field="vector",
-            param={"metric_type": "COSINE"}, limit=top_k)
+            param={"metric_type": "COSINE"}, limit=top_k, **kw)
         sparse = AnnSearchRequest(         # 稀疏路：字面命中（查询原文进来，库内 jieba 分词打 BM25）
             data=[query], anns_field="sparse",
-            param={"metric_type": "BM25"}, limit=top_k)
+            param={"metric_type": "BM25"}, limit=top_k, **kw)
         hits = self.client.hybrid_search(
             self.COLLECTION, [dense, sparse], ranker=RRFRanker(RRF_K),
             limit=top_k,

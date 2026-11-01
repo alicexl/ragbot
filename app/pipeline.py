@@ -11,6 +11,7 @@ web 路由、钉钉 bot、评测脚本三个调用方共享同一套——Milvus
 
 import hashlib
 import os
+import re
 import time
 from dataclasses import dataclass
 
@@ -74,6 +75,20 @@ def _to_entries(hits: list[dict], order: list[int], scores: dict[int, float]) ->
             for i in order for h in [hits[i]]]
 
 
+def detect_entities(question: str) -> list[tuple[str, list[str]]]:
+    """问句命中的库内实体（when/who/what 里的 who）及其全部 source，长名优先防
+    子串误配。词典来自 sources() 去掉「20XX年报/简报」年份后缀的公司名——库内
+    实体是有限集合，字符串命中即高置信，规则匹配不走 LLM（与斜杠命令走规则同一
+    哲学）。实体用于圈定检索范围（标量过滤），不参与排序——排序交给残句里的
+    when（年份）/what（指标），否则实体名高词频块（释义表）会碾压指标块。"""
+    by_entity: dict[str, list[str]] = {}
+    for src in store.sources():
+        m = re.match(r"^(.+?)20\d{2}", src)
+        by_entity.setdefault(m.group(1) if m else src, []).append(src)
+    return [(n, by_entity[n]) for n in sorted(by_entity, key=len, reverse=True)
+            if n in question]
+
+
 def retrieve(question: str, top_k: int = TOP_K, rid: str | None = None,
              use_rerank: bool = False, history: list[dict] | None = None,
              pre: str | None = None):
@@ -92,9 +107,26 @@ def retrieve(question: str, top_k: int = TOP_K, rid: str | None = None,
     if mode not in ("off", "rewrite", "hyde", "multi"):
         raise ValueError(f"未知 pre 模式：{mode}（off/rewrite/hyde/multi）")
 
-    queries = [question]      # BM25 路用的查询文本（multi 时为变体列表）
+    queries = [question]      # BM25 路用的查询文本（multi/per-entity 时为列表）
     vec_texts = [question]    # dense 路要向量化的文本（hyde 时为假设文档）
-    if mode != "off":
+    filters = [""]            # 各路标量过滤（per-entity 路按公司圈定，其余路不过滤）
+    entities = detect_entities(question) if mode == "off" else []
+    if len(entities) >= 2:
+        # per-entity fan-out（多实体问题的 when/who/what 拆解）：who 用于**圈定范围**
+        # （source in [该公司全部文档]）而非参与排序——实体名留在查询里会让释义表
+        # 这类高词频块霸榜（云天化三份释义表霸掉全部坑位，p4 会计表进不了 context）；
+        # 排序交给残句的 when/what（年份+指标），公司内部「2024 营业收入」自然顶到
+        # p4 表。各实体路按名次轮转占坑（每实体第一名必进 context），余位全局 RRF
+        # 补齐（原问路只补坑不占坑）；单实体问题不拆，零开销。与 pre 模式互斥不组合。
+        stripped = question
+        for e, _ in entities:
+            stripped = stripped.replace(e, " ")
+        queries = vec_texts = [stripped] * len(entities) + [question]
+        filters = ['source in [' + ",".join(f'"{s}"' for s in srcs) + ']'
+                   for _, srcs in entities] + [""]
+        trace.record(rid, "entity_fanout", 0.0,
+                     meta={"entities": [e for e, _ in entities]})
+    elif mode != "off":
         t = time.perf_counter()
         try:
             if mode == "rewrite":
@@ -116,6 +148,28 @@ def retrieve(question: str, top_k: int = TOP_K, rid: str | None = None,
     t = time.perf_counter()
     if len(vecs) == 1:
         hits = store.hybrid_search(queries[0], vecs[0], top_k=RECALL_K)
+    elif entities:
+        # per-entity 轮转配额合并：各实体路按名次轮转先占坑——每实体的第一名必进
+        # context。纯 RRF 会让跨路噪声挤掉单路第一名（M01 实测：云天化路 rank-1 被
+        # distractor 挤出 Top-5，模型对着缺块的 context 如实拒答）；不足 top_k 再按
+        # 全局 RRF 补齐，原问路不占坑只参与补齐。
+        route_lists = [store.hybrid_search(q, v, top_k=RECALL_K, filter=f)
+                       for q, v, f in zip(queries, vecs, filters)]
+        hits, seen = [], set()
+        for pair in zip(*route_lists[:-1]):            # 末路 = 原问，不占坑
+            for h in pair:
+                if h["id"] not in seen and len(hits) < top_k:
+                    seen.add(h["id"])
+                    hits.append(h)
+        scores: dict[int, float] = {}
+        by_id: dict[int, dict] = {}
+        for route in route_lists:
+            for rank, h in enumerate(route):
+                hid = h["id"]
+                scores[hid] = scores.get(hid, 0.0) + 1.0 / (60 + rank)
+                by_id.setdefault(hid, h)
+        hits += [by_id[hid] for hid in sorted(scores, key=scores.get, reverse=True)
+                 if hid not in seen][:top_k - len(hits)]
     else:                      # multi：每变体一路（变体+原问），跨列表 RRF 合并去重
         scores: dict[int, float] = {}
         by_id: dict[int, dict] = {}
