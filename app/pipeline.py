@@ -217,13 +217,36 @@ def retrieve(question: str, top_k: int = TOP_K, rid: str | None = None,
     return entries, reranked
 
 
+def group_by_source(entries: list[RetrievedChunk]) -> list[RetrievedChunk]:
+    """展示序收口：同 source 的块聚到一起（组序=该文档首个块的检索名次，组内保持
+    名次序），(source, text) 全同的块去重留首个（上游已按 Milvus id 去重，这里兜底
+    跨路同文本不同 id 的极端形态）。build_context 的引用编号与 web sources 面板 /
+    bot 脚注的编号必须同源——三个消费方都从这里取展示序；retrieve() 的返回序
+    （检索名次，eval 判分口径）不动。"""
+    seen: set[tuple[str, str]] = set()
+    grouped: dict[str, list[RetrievedChunk]] = {}
+    for e in entries:
+        key = (e.source, e.content or e.text)
+        if key in seen:
+            continue
+        seen.add(key)
+        grouped.setdefault(e.source, []).append(e)
+    return [e for chunks in grouped.values() for e in chunks]
+
+
 def build_context(retrieved: list[RetrievedChunk]) -> str:
-    """把精排后的 Top-K 拼成带编号 + 类型 + 来源标注的 context（回填 content 原文：
-    表格=HTML、图片=描述）。来源标注让模型在多文档下按公司/年份正确归因——
-    10-29 实测：无来源标注时模型把盐湖的数字安到云天化头上（M01/M03 探针）。"""
-    parts = [f"[{i}][{llm._TYPE_LABEL.get(e.chunk_type, '正文')}｜来源：{e.source}] "
-             f"{e.content or e.text}" for i, e in enumerate(retrieved, 1)]
-    return "\n\n".join(parts)
+    """Top-K 按文档分组拼装：【文档：X】头 + 组内 [n][类型] + content（回填原文：
+    表格=HTML、图片=描述），编号跨组连续。分组给多文档题（M01/M02 跨公司比较）
+    「每文档一份」的清晰结构；来源标注让模型按公司/年份正确归因——10-29 实测：
+    无来源标注时模型把盐湖的数字安到云天化头上（M01/M03 探针）。"""
+    parts: list[str] = []
+    src = None
+    for i, e in enumerate(group_by_source(retrieved), 1):
+        if e.source != src:
+            src = e.source
+            parts.append(f"【文档：{e.source}】")
+        parts.append(f"[{i}][{llm._TYPE_LABEL.get(e.chunk_type, '正文')}] {e.content or e.text}")
+    return "\n".join(parts)
 
 
 def build_user_msg(question: str, retrieved: list[dict], history: list[dict] | None = None) -> list[dict]:

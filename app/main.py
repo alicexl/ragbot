@@ -137,7 +137,7 @@ def chat():
                                             history=history)                   # 混合检索
     llm_messages = pipeline.build_user_msg(message, retrieved, history)        # 增强：拼 context
     sources_payload = []
-    for i, e in enumerate(retrieved, 1):
+    for i, e in enumerate(pipeline.group_by_source(retrieved), 1):   # 展示序=context 引用编号序
         m = re.search(r"原图文件：(.+)$", e.content, re.M) if e.chunk_type == "image" else None
         sources_payload.append({
             "i": i, "rrf": round(e.rrf, 4),

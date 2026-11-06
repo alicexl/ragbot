@@ -85,7 +85,7 @@ def build_reply(answer: str, retrieved: list[dict]) -> str:
     parts = [answer]
     if retrieved:
         parts.append("\n\n---\n**本次依据**")
-        for i, e in enumerate(retrieved, 1):
+        for i, e in enumerate(pipeline.group_by_source(retrieved), 1):   # 展示序=context 引用编号序
             sec = f"｜{e.section}" if e.section else ""
             where = f" {e.source}{sec} p{e.page}" if e.page else f" {e.source}{sec}"
             parts.append(f"\n[{i}]（{llm._TYPE_LABEL.get(e.chunk_type, '正文')}）{where}")
