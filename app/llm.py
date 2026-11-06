@@ -252,8 +252,13 @@ class StreamedAnswer:
                             raise TimeoutError(f"生成总时长超 {GEN_TOTAL_TIMEOUT}s")
                         buf += delta
                         yield delta
-                    self.usage = (s.get_final_message().usage.input_tokens
-                                  + s.get_final_message().usage.output_tokens)
+                    # token 记账含缓存两字段（11-07 修）：DeepSeek 前缀缓存命中时
+                    # input_tokens 只报未命中尾部，漏加 cache_read 会让 token 数随
+                    # 缓存状态漂移 4 倍（探针实证 input=179+cache_read=4096）。
+                    u = s.get_final_message().usage
+                    self.usage = (u.input_tokens + u.output_tokens
+                                  + (u.cache_read_input_tokens or 0)
+                                  + (u.cache_creation_input_tokens or 0))
                 self._trace.record(self.rid, "gen_total", (time.perf_counter() - t0) * 1000,
                                    meta={"attempt": attempt} if attempt > 1 else None)
                 return
