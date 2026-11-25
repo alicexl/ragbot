@@ -235,16 +235,8 @@ copy deploy\env.bat.example deploy\env.bat    # 填 key（此文件已 gitignore
 deploy\start.bat                              # 前台跑，先验证一遍
 ```
 
-常驻用 NSSM 装成 Windows 服务（开机自启 + 崩溃自动拉起）：
-
-```
-nssm install ragbot "D:\Anaconda3\python.exe" "-X utf8 -m app.main"
-nssm set ragbot AppDirectory D:\workspace\ragbot
-nssm set ragbot AppStdout D:\workspace\ragbot\ragbot_server.log
-nssm set ragbot AppStderr D:\workspace\ragbot\ragbot_server.log
-（env 在 nssm set ragbot Environment 里配，或系统级环境变量）
-nssm start ragbot
-```
+常驻即手动起 `deploy\start.bat`（PowerShell `Start-Process` 起独立控制台，关窗=停服）。
+不装 NSSM 服务（2026-11-25 拍板：手动启动即可）。
 
 ## 演进记录（关键事实与结论）
 
